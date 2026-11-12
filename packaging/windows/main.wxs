@@ -8,8 +8,12 @@
     Name="Inkdown"
     Manufacturer="ice-a"
     Version="$(var.Version)"
-    UpgradeCode="7088BA2F-8EE2-4BB9-80ED-5EF8E87EC449"
+    UpgradeCode="7C3E9A52-6B4D-4C8F-9A21-58D7F0B2E6A1"
     Scope="perUser">
+    <!-- Force true per-user semantics: files under %LOCALAPPDATA% and the
+         Add/Remove entry under HKCU, with no elevation prompt. -->
+    <Property Id="ALLUSERS" Value="2" />
+    <Property Id="MSIINSTALLPERUSER" Value="1" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of Inkdown is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
