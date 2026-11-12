@@ -52,7 +52,7 @@ cargo build --release
 
 | 平台 | 包 | 安装方式 |
 | --- | --- | --- |
-| Windows x64 | `.msi` | 双击安装到 Program Files，并创建开始菜单快捷方式 |
+| Windows x64 | `.msi` | 双击安装（**按用户安装**到 `%LOCALAPPDATA%\Programs\Inkdown`，无需管理员权限），创建开始菜单快捷方式 |
 | macOS（Apple Silicon） | `.dmg` | 拖入 Applications；未做公证签名，首次请右键 → 打开 |
 | Linux x64 | `.deb` | `sudo apt install ./Inkdown-*.deb` |
 

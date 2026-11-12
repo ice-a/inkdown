@@ -9,11 +9,14 @@
     Manufacturer="ice-a"
     Version="$(var.Version)"
     UpgradeCode="7088BA2F-8EE2-4BB9-80ED-5EF8E87EC449"
-    Scope="perMachine">
+    Scope="perUser">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Inkdown is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <StandardDirectory Id="ProgramFiles64Folder">
+    <!-- Per-user install: %LOCALAPPDATA%\Programs\Inkdown. A standard
+         (non-admin) Windows account can install without any UAC prompt. -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
       <Directory Id="INSTALLFOLDER" Name="Inkdown">
         <Component Id="InkdownExe" Guid="AA28E20C-039F-4C1D-BC0C-3CCDC0FBDFED">
           <File Id="InkdownExeFile" Source="$(var.SourceDir)/inkdown.exe" KeyPath="yes">
@@ -25,6 +28,7 @@
               Advertise="yes" />
           </File>
         </Component>
+      </Directory>
       </Directory>
     </StandardDirectory>
 
