@@ -101,6 +101,30 @@ impl SettingsForm {
         }
     }
 
+    /// Every single-line field, so the view can watch them all for edits.
+    pub fn inputs(&self) -> Vec<Entity<InputState>> {
+        vec![
+            self.ai_base.clone(),
+            self.ai_key.clone(),
+            self.ai_model.clone(),
+            self.image_url.clone(),
+            self.image_auth.clone(),
+            self.image_token.clone(),
+            self.wx_appid.clone(),
+            self.wx_secret.clone(),
+            self.wx_author.clone(),
+            self.wx_cover.clone(),
+            self.cn_user.clone(),
+            self.cn_token.clone(),
+            self.cn_blogid.clone(),
+            self.git_remote.clone(),
+            self.git_branch.clone(),
+            self.git_name.clone(),
+            self.git_email.clone(),
+            self.backup_dir.clone(),
+        ]
+    }
+
     pub fn apply(&self, config: &mut AppConfig, cx: &App) -> Result<(), String> {
         config.ai = self.ai(cx);
         config.image_host = self.image_host(cx);

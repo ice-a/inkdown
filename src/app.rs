@@ -5,7 +5,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _,
+    TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{
@@ -56,12 +57,16 @@ pub struct InkdownApp {
 
     settings_open: bool,
     settings: SettingsForm,
+    settings_watch: Vec<Subscription>,
     ai_open: bool,
     ai: AiForm,
     publish_open: bool,
     publish: PublishForm,
     prompt: Option<PromptState>,
     action_busy: Option<String>,
+    /// Set when a close was refused for unsaved documents; holds the count.
+    close_confirm: Option<usize>,
+    quit_confirmed: bool,
 }
 
 /// Where the AI result lands.
@@ -136,12 +141,15 @@ impl InkdownApp {
             sidebar_tab,
             settings_open: false,
             settings,
+            settings_watch: Vec::new(),
             ai_open: false,
             ai,
             publish_open: false,
             publish,
             prompt: None,
             action_busy: None,
+            close_confirm: None,
+            quit_confirmed: false,
         };
 
         let change_sub = cx.subscribe(&editor, |this, _editor, event, cx| {
@@ -157,6 +165,32 @@ impl InkdownApp {
 
         let focus = this.editor.read(cx).focus_handle(cx);
         window.defer(cx, move |window, cx| focus.focus(window, cx));
+
+        // Closing the window quits the app; keep the user from losing unsaved
+        // work without a confirmation, and flush pending settings first.
+        let handle = cx.weak_entity();
+        window.on_window_should_close(cx, move |_window, cx| {
+            let handle = handle.clone();
+            handle
+                .update(cx, |this, cx| {
+                    if this.quit_confirmed {
+                        return true;
+                    }
+                    if this.settings_open {
+                        let _ = this.flush_settings(cx);
+                    }
+                    let dirty = this.docs.iter().filter(|doc| doc.is_dirty()).count();
+                    if dirty == 0 {
+                        return true;
+                    }
+                    if this.close_confirm != Some(dirty) {
+                        this.close_confirm = Some(dirty);
+                        cx.notify();
+                    }
+                    false
+                })
+                .unwrap_or(true)
+        });
         this
     }
 
@@ -1773,6 +1807,7 @@ impl InkdownApp {
                                 state.set_value(first, window, cx);
                             });
                         }
+                        this.flush_settings(cx).ok();
                         this.settings.notice = Some(format!("拉取到 {count} 个模型"));
                     }
                     Err(error) => {
@@ -1816,6 +1851,7 @@ impl InkdownApp {
                                         this.settings.ai_model.update(cx, |state, cx| {
                                             state.set_value(value, window, cx);
                                         });
+                                        this.flush_settings(cx).ok();
                                         cx.notify();
                                     })
                                     .ok();
@@ -2037,6 +2073,7 @@ impl InkdownApp {
                             "参考当前文档",
                             "把当前文稿（最多 6000 字）发给模型，用于续写、改写或扩写",
                             self.ai.use_context,
+                            false,
                             cx,
                             |this| {
                                 this.ai.use_context = !this.ai.use_context;
@@ -2183,19 +2220,51 @@ impl InkdownApp {
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let config = cx.global::<config::AppConfig>().clone();
         self.settings = SettingsForm::new(window, cx, &config);
+        self.settings_watch = Self::watch_settings(&self.settings, cx);
         self.settings_open = true;
         cx.notify();
     }
 
-    fn save_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Write the settings form into the global config and onto disk.
+    ///
+    /// Called on every edit in the settings dialog, so the dialog needs no
+    /// explicit save: closing it in any way keeps what was typed.
+    fn flush_settings(&self, cx: &mut App) -> Result<(), String> {
         let mut config = cx.global::<config::AppConfig>().clone();
-        if let Err(error) = self.settings.apply(&mut config, cx) {
-            self.settings.notice = Some(error);
-            cx.notify();
-            return;
+        self.settings.apply(&mut config, cx)?;
+        *cx.global_mut::<config::AppConfig>() = config.clone();
+        config::save_to_disk(&config)
+    }
+
+    /// Persist every edit made in the settings dialog as it happens.
+    fn watch_settings(form: &SettingsForm, cx: &mut Context<Self>) -> Vec<Subscription> {
+        let mut watch = Vec::new();
+        for input in form.inputs() {
+            watch.push(cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.flush_settings(cx).ok();
+                }
+            }));
         }
-        *cx.global_mut::<config::AppConfig>() = config;
-        match config::save(cx) {
+        let prompt = form.ai_prompt.clone();
+        watch.push(cx.subscribe(&prompt, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.flush_settings(cx).ok();
+            }
+        }));
+        watch
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.flush_settings(cx) {
+            self.settings.notice = Some(format!("保存失败：{error}"));
+        }
+        self.settings_open = false;
+        cx.notify();
+    }
+
+    fn save_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.flush_settings(cx) {
             Ok(()) => {
                 self.settings_open = false;
                 self.notice = Some("设置已保存".to_string());
@@ -2661,6 +2730,10 @@ impl InkdownApp {
     }
 
     fn on_close_overlay(&mut self, _: &CloseOverlay, _: &mut Window, cx: &mut Context<Self>) {
+        if self.close_confirm.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.prompt.take().is_some() {
             cx.notify();
             return;
@@ -2676,8 +2749,7 @@ impl InkdownApp {
             return;
         }
         if self.settings_open {
-            self.settings_open = false;
-            cx.notify();
+            self.close_settings(cx);
         }
     }
 
@@ -2783,10 +2855,7 @@ impl InkdownApp {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::X)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_open = false;
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
                         ),
                 )
                 .child(
@@ -2978,6 +3047,7 @@ impl InkdownApp {
                                     "外链转参考",
                                     "公众号正文里的外链会被移除，开启后在文末生成参考链接列表",
                                     self.settings.wechat_footnote,
+                                    true,
                                     cx,
                                     |this| {
                                         this.settings.wechat_footnote =
@@ -3037,6 +3107,7 @@ impl InkdownApp {
                                     "保存后自动同步",
                                     "每次保存文档后提交并推送",
                                     self.settings.git_auto_sync,
+                                    true,
                                     cx,
                                     |this| {
                                         this.settings.git_auto_sync =
@@ -3096,6 +3167,7 @@ impl InkdownApp {
                                     "保存后自动备份",
                                     "频繁保存时会产生多个 zip，建议只做手动备份",
                                     self.settings.auto_backup,
+                                    true,
                                     cx,
                                     |this| {
                                         this.settings.auto_backup =
@@ -3150,25 +3222,18 @@ impl InkdownApp {
                                             .text_xs()
                                             .truncate()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child(config::config_path().display().to_string()),
+                                            .child(format!(
+                                                "自动保存 · {}",
+                                                config::config_path().display()
+                                            )),
                                     )
                                 }),
-                        )
-                        .child(
-                            Button::new("settings-cancel")
-                                .ghost()
-                                .xsmall()
-                                .label("取消")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_open = false;
-                                    cx.notify();
-                                })),
                         )
                         .child(
                             Button::new("settings-save")
                                 .primary()
                                 .xsmall()
-                                .label("保存设置")
+                                .label("完成")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.save_settings(window, cx)
                                 })),
@@ -3234,6 +3299,7 @@ impl InkdownApp {
             .selected(self.settings.image_kind == kind)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.settings.image_kind = kind;
+                this.flush_settings(cx).ok();
                 cx.notify();
             }))
     }
@@ -3244,6 +3310,7 @@ impl InkdownApp {
         label: &'static str,
         hint: &'static str,
         checked: bool,
+        persist: bool,
         cx: &mut Context<Self>,
         toggle: F,
     ) -> impl IntoElement
@@ -3259,6 +3326,9 @@ impl InkdownApp {
             .cursor(CursorStyle::PointingHand)
             .on_click(cx.listener(move |this, _, _, cx| {
                 toggle(this);
+                if persist {
+                    this.flush_settings(cx).ok();
+                }
                 cx.notify();
             }))
             .child(
@@ -3381,6 +3451,7 @@ impl InkdownApp {
                                     "上传本地图片到图床",
                                     "发布前把本地相对路径图片上传，并改写 Markdown 源文件",
                                     self.publish.upload_images,
+                                    false,
                                     cx,
                                     |this| {
                                         this.publish.upload_images =
@@ -3638,6 +3709,77 @@ impl InkdownApp {
                     ),
             )
             .into_any_element()
+    }
+
+    fn close_confirm_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(dirty) = self.close_confirm else {
+            return div().into_any_element();
+        };
+        self.modal_shell("quit-confirm-overlay", cx).child(
+            v_flex()
+                .w(px(440.))
+                .rounded_lg()
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().popover)
+                .overflow_hidden()
+                .occlude()
+                .child(
+                    h_flex()
+                        .px_5()
+                        .pt_5()
+                        .gap_3()
+                        .items_start()
+                        .child(
+                            Icon::new(IconName::TriangleAlert)
+                                .with_size(px(18.))
+                                .text_color(cx.theme().warning),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1()
+                                .child(div().text_base().font_semibold().child("还有未保存的修改"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "{dirty} 个文档有未保存的内容，直接退出将会丢失。"
+                                        )),
+                                ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .h(px(58.))
+                        .px_5()
+                        .gap_2()
+                        .items_center()
+                        .justify_end()
+                        .child(
+                            Button::new("quit-cancel")
+                                .ghost()
+                                .xsmall()
+                                .label("留在编辑")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_confirm = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("quit-confirm")
+                                .danger()
+                                .xsmall()
+                                .label("退出")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.quit_confirmed = true;
+                                    cx.quit();
+                                })),
+                        ),
+                ),
+        )
+        .into_any_element()
     }
 
     fn prompt_modal(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -4392,6 +4534,9 @@ impl Render for InkdownApp {
                 this.child(self.publish_modal(cx))
             })
             .when(self.ai_open, |this| this.child(self.ai_modal(cx)))
+            .when(self.close_confirm.is_some(), |this| {
+                this.child(self.close_confirm_modal(cx))
+            })
             .when(self.prompt.is_some(), |this| this.child(self.prompt_modal(cx)))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_open))
