@@ -20,6 +20,7 @@ use pulldown_cmark::{
 use serde_json::{Value, json};
 
 use crate::config::{CnblogsConfig, ImageHostConfig, ImageHostKind, WechatConfig};
+use crate::doc::split_frontmatter;
 use crate::imagebed;
 
 // ---------------------------------------------------------------------------
@@ -593,6 +594,7 @@ fn escape_attr(value: &str) -> String {
 }
 
 pub fn excerpt(markdown: &str, limit: usize) -> String {
+    let (_, markdown) = split_frontmatter(markdown);
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -771,6 +773,7 @@ pub fn wechat_publish(
     if config.app_id.trim().is_empty() || config.app_secret.trim().is_empty() {
         return Err("还没有填写公众号 AppID / AppSecret".to_string());
     }
+    let markdown = split_frontmatter(markdown).1;
     let token = wechat_token(config.app_id.trim(), config.app_secret.trim())?;
     let mut warnings = Vec::new();
     let mut image_map = HashMap::new();
@@ -980,13 +983,14 @@ pub fn publish(request: PublishRequest) -> PublishOutcome {
     }
 
     let selected = request.targets.selected();
-    let generic_html = render_inline_html(&source, &HashMap::new(), false);
+    let (_, body) = split_frontmatter(&source);
+    let generic_html = render_inline_html(body, &HashMap::new(), false);
     let wechat_manual = request.targets.wechat
         && (request.wechat.app_id.trim().is_empty()
             || request.wechat.app_secret.trim().is_empty());
     let clipboard_html = if wechat_manual {
         Some(render_inline_html(
-            &source,
+            body,
             &HashMap::new(),
             request.wechat.footnote_links,
         ))
@@ -1088,6 +1092,26 @@ mod tests {
         assert!(html.contains("img src=\"https://example.com/a.png\""));
         assert!(html.contains("REFERENCE"));
         assert!(html.contains("https://example.com"));
+    }
+
+
+    #[test]
+    fn publish_html_ignores_frontmatter() {
+        let mut targets = Targets::default();
+        targets.zhihu = true;
+        let outcome = publish(PublishRequest {
+            title: "t".to_string(),
+            source: "---\ntitle: 逆向\n---\n# 正文\n".to_string(),
+            doc_dir: PathBuf::from("."),
+            image_host: ImageHostConfig::default(),
+            wechat: WechatConfig::default(),
+            cnblogs: CnblogsConfig::default(),
+            targets,
+            upload_images: false,
+        });
+        let html = outcome.clipboard_html.expect("clipboard html");
+        assert!(!html.contains("title: 逆向"));
+        assert!(html.contains("正文"));
     }
 
     #[test]

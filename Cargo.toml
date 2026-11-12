@@ -1,6 +1,6 @@
 [package]
 name = "inkdown"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Inkdown - a beautifully crafted Markdown editor built with GPUI Kit"
 authors = ["ice-a"]
@@ -16,6 +16,7 @@ arboard = "3.7"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 dirs = "6"
 chrono = { version = "0.4", features = ["clock"] }
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
 
 [profile.dev]
 opt-level = 0

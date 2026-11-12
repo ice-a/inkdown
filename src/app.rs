@@ -15,7 +15,7 @@ use gpui_kit::component::{
     },
     menu::{DropdownMenu as _, PopupMenuItem},
     resizable::{h_resizable, resizable_panel},
-    text::{SelectionFormat, TextView, TextViewState},
+    text::{FrontmatterPlugin, MarkdownExtensions, SelectionFormat, TextView, TextViewState},
     v_flex,
 };
 use gpui_kit::assets::IconName;
@@ -685,6 +685,11 @@ impl InkdownApp {
                     PopupMenuItem::new("链接")
                         .icon(IconName::Link)
                         .action(Box::new(FormatLink)),
+                )
+                .item(
+                    PopupMenuItem::new("插入图片")
+                        .icon(IconName::Image)
+                        .action(Box::new(FormatImage)),
                 )
                 .separator()
                 .item(
@@ -1772,6 +1777,78 @@ impl InkdownApp {
         }
     }
 
+    /// Save a clipboard image next to the document and insert its Markdown.
+    ///
+    /// Clipboard images often arrive as BMP (screenshot tools), which neither
+    /// the preview nor the publishing targets accept; those are re-encoded as
+    /// PNG before they are written.
+    fn paste_image(&mut self, image: Image, window: &mut Window, cx: &mut Context<Self>) {
+        let (bytes, extension) = match image.format {
+            ImageFormat::Png => (image.bytes.clone(), "png"),
+            ImageFormat::Jpeg => (image.bytes.clone(), "jpg"),
+            ImageFormat::Webp => (image.bytes.clone(), "webp"),
+            ImageFormat::Gif => (image.bytes.clone(), "gif"),
+            ImageFormat::Svg => (image.bytes.clone(), "svg"),
+            _ => match image::load_from_memory(&image.bytes) {
+                Ok(dynamic) => {
+                    let mut png = Vec::new();
+                    if dynamic
+                        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                        .is_err()
+                    {
+                        self.notice = Some("图片转码失败".to_string());
+                        cx.notify();
+                        return;
+                    }
+                    (png, "png")
+                }
+                Err(error) => {
+                    self.notice = Some(format!("无法读取剪贴板图片：{error}"));
+                    cx.notify();
+                    return;
+                }
+            },
+        };
+        let assets = self.current_doc_dir().join("assets");
+        if let Err(error) = std::fs::create_dir_all(&assets) {
+            self.notice = Some(format!("创建 assets 目录失败：{error}"));
+            cx.notify();
+            return;
+        }
+        let name = format!(
+            "pasted-{}.{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            extension
+        );
+        match std::fs::write(assets.join(&name), &bytes) {
+            Ok(()) => {
+                let relative = format!("assets/{name}");
+                self.editor.update(cx, |state, cx| {
+                    state.insert(format!("![]({relative})"), window, cx);
+                });
+                self.after_edit(window, cx);
+                self.notice = Some(format!("图片已保存到 {relative}"));
+            }
+            Err(error) => {
+                self.notice = Some(format!("保存图片失败：{error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_format_image(&mut self, _: &FormatImage, window: &mut Window, cx: &mut Context<Self>) {
+        let image = cx
+            .read_from_clipboard()
+            .and_then(|item| clipboard_image(&item));
+        match image {
+            Some(image) => self.paste_image(image, window, cx),
+            None => {
+                self.notice = Some("剪贴板里没有图片".to_string());
+                cx.notify();
+            }
+        }
+    }
+
     // ---- AI -------------------------------------------------------------
 
     fn open_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2618,8 +2695,9 @@ impl InkdownApp {
                         uploaded = result.uploaded;
                         warnings = result.warnings;
                     }
+                    let (_, body) = doc::split_frontmatter(&source);
                     let html = publish::render_inline_html(
-                        &source,
+                        body,
                         &std::collections::HashMap::new(),
                         footnote,
                     );
@@ -4112,6 +4190,7 @@ impl InkdownApp {
     }
 
     fn editor_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let handle = cx.weak_entity();
         v_flex()
             .size_full()
             .min_w_0()
@@ -4124,6 +4203,15 @@ impl InkdownApp {
             .child(
                 div().flex_1().min_h_0().child(
                     Editor::new(&self.editor)
+                        .on_paste(move |item, window, cx| {
+                            let Some(image) = clipboard_image(item) else {
+                                return false;
+                            };
+                            handle
+                                .update(cx, |this, cx| this.paste_image(image, window, cx))
+                                .ok();
+                            true
+                        })
                         .appearance(false)
                         .bordered(false)
                         .h(relative(1.))
@@ -4183,6 +4271,10 @@ impl InkdownApp {
                                 .selectable(true)
                                 .scrollable(true)
                                 .selection_format(SelectionFormat::Source)
+                                .markdown_extensions(
+                                    MarkdownExtensions::default().frontmatter(),
+                                )
+                                .plugin(FrontmatterPlugin::new())
                                 .image_source(move |uri| {
                                     let source = uri.to_string();
                                     if let Some(path) = publish::local_path(&source, doc_dir.as_ref())
@@ -4567,6 +4659,7 @@ impl Render for InkdownApp {
             .on_action(cx.listener(Self::on_format_inline_code))
             .on_action(cx.listener(Self::on_format_code_block))
             .on_action(cx.listener(Self::on_format_link))
+            .on_action(cx.listener(Self::on_format_image))
             .on_action(cx.listener(Self::on_format_h1))
             .on_action(cx.listener(Self::on_format_h2))
             .on_action(cx.listener(Self::on_format_quote))
@@ -4581,6 +4674,14 @@ const TABLE_TEMPLATE: &str = "\n| 列 1 | 列 2 | 列 3 |
 | --- | --- | --- |
 | 内容 | 内容 | 内容 |
 ";
+
+/// The first image carried by a clipboard item, if any.
+fn clipboard_image(item: &ClipboardItem) -> Option<Image> {
+    item.entries.iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) => Some(image.clone()),
+        _ => None,
+    })
+}
 
 /// First `# ` heading, used as the generated document's title.
 fn first_heading(source: &str) -> Option<String> {

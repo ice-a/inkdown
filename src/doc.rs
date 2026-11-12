@@ -64,12 +64,38 @@ pub struct Stats {
     pub minutes: usize,
 }
 
-pub fn outline(source: &str) -> Vec<Heading> {
-    let mut headings = Vec::new();
+/// Split a leading YAML frontmatter block (`---` … `---`) from the body.
+///
+/// Returns the frontmatter block including both delimiter lines when the
+/// document starts with a closed `---` block, and the remaining document.
+/// An unterminated opening `---` is not frontmatter and passes through.
+pub fn split_frontmatter(source: &str) -> (Option<&str>, &str) {
     let mut offset = 0usize;
+    let mut seen_opening = false;
+    for line in source.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\r', '\n']);
+        if !seen_opening {
+            if text.trim_end() != "---" {
+                return (None, source);
+            }
+            seen_opening = true;
+        } else if text.trim_end() == "---" {
+            let end = offset + line.len();
+            return (Some(&source[..end]), &source[end..]);
+        }
+        offset += line.len();
+    }
+    (None, source)
+}
+
+pub fn outline(source: &str) -> Vec<Heading> {
+    let (frontmatter, body) = split_frontmatter(source);
+    let base = frontmatter.map(str::len).unwrap_or(0);
+    let mut headings = Vec::new();
+    let mut offset = base;
     let mut fence: Option<(char, usize)> = None;
 
-    for line in source.split_inclusive('\n') {
+    for line in body.split_inclusive('\n') {
         let text = line.trim_end_matches(['\r', '\n']);
         let trimmed = text.trim_start();
 
@@ -118,12 +144,13 @@ fn parse_heading(trimmed: &str) -> Option<(usize, String)> {
 }
 
 pub fn stats(source: &str) -> Stats {
+    let (_, body) = split_frontmatter(source);
     let mut chars = 0usize;
     let mut cjk = 0usize;
     let mut latin_words = 0usize;
     let mut in_word = false;
 
-    for ch in source.chars() {
+    for ch in body.chars() {
         if !ch.is_whitespace() {
             chars += 1;
         }
@@ -181,7 +208,8 @@ pub fn export_html(title: &str, source: &str) -> String {
     options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
 
-    let parser = Parser::new_ext(source, options);
+    let (_, body) = split_frontmatter(source);
+    let parser = Parser::new_ext(body, options);
     let mut body = String::new();
     html::push_html(&mut body, parser);
 
@@ -452,3 +480,30 @@ const LETTER: &str = r#"# 给未来的自己
 
 *—— 写于一个普通的下午*
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_yaml_frontmatter() {
+        let source = "---\ntitle: 逆向\nauthor: \naccount: 未知公众号\n---\n# 正文\n\n内容";
+        let (front, body) = split_frontmatter(source);
+        let front = front.expect("frontmatter");
+        assert!(front.starts_with("---\n"));
+        assert!(front.ends_with("---\n"));
+        assert_eq!(body, "# 正文\n\n内容");
+        let headings = outline(source);
+        assert_eq!(headings[0].title, "正文");
+        assert_eq!(headings[0].offset, front.len());
+        assert_eq!(stats(source).lines, source.lines().count());
+    }
+
+    #[test]
+    fn unterminated_frontmatter_passes_through() {
+        let source = "---\n# 标题\n";
+        assert_eq!(split_frontmatter(source), (None, source));
+        let plain = "# 标题";
+        assert_eq!(split_frontmatter(plain), (None, plain));
+    }
+}

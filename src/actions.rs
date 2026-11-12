@@ -29,6 +29,7 @@ actions!(
         FormatInlineCode,
         FormatCodeBlock,
         FormatLink,
+        FormatImage,
         FormatHeading1,
         FormatHeading2,
         FormatQuote,
