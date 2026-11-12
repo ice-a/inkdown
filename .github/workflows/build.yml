@@ -23,12 +23,15 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_os: windows-x86_64
+            exe: inkdown.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset_os: linux-x86_64
+            exe: inkdown
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_os: macos-aarch64
+            exe: inkdown
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -59,18 +62,21 @@ jobs:
 
       - name: Package
         run: |
+          # Every test lives in an `if` condition: under `bash -e` a bare
+          # `$( [ ] && ... )` substitution returns 1 on the false side and
+          # kills the assignment — that is what failed the macOS job once.
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             VERSION="$GITHUB_REF_NAME"
           else
-            VERSION="$(echo "$GITHUB_SHA" | cut -c1-7)"
+            VERSION="${GITHUB_SHA:0:7}"
           fi
           NAME="Inkdown-${VERSION}-${{ matrix.asset_os }}"
-          EXE="target/${{ matrix.target }}/release/inkdown$([ "$RUNNER_OS" = "Windows" ] && echo .exe)"
-          cp "$EXE" inkdown$([ "$RUNNER_OS" = "Windows" ] && echo .exe)
+          EXE="target/${{ matrix.target }}/release/${{ matrix.exe }}"
+          cp "$EXE" "${{ matrix.exe }}"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "${NAME}.zip" "inkdown.exe" README.md > /dev/null
+            7z a "${NAME}.zip" "${{ matrix.exe }}" README.md > /dev/null
           else
-            zip "${NAME}.zip" inkdown README.md
+            zip "${NAME}.zip" "${{ matrix.exe }}" README.md
           fi
           ls -lh "${NAME}.zip"
           echo "NAME=${NAME}" >> "$GITHUB_ENV"
