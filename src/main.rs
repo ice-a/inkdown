@@ -1,3 +1,7 @@
+// Release builds are GUI apps: without this, Windows opens a console window
+// next to the app and closing it kills the process.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod actions;
 mod ai;
 mod app;

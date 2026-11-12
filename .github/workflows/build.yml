@@ -23,15 +23,15 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_os: windows-x86_64
-            exe: inkdown.exe
+            package_ext: msi
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset_os: linux-x86_64
-            exe: inkdown
+            package_ext: deb
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_os: macos-aarch64
-            exe: inkdown
+            package_ext: dmg
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -60,31 +60,92 @@ jobs:
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Resolve package name
         run: |
-          # Every test lives in an `if` condition: under `bash -e` a bare
-          # `$( [ ] && ... )` substitution returns 1 on the false side and
-          # kills the assignment — that is what failed the macOS job once.
+          # VERSION labels the file; PKG_VERSION must be numeric for MSI/DEB
+          # metadata on non-tag builds.
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             VERSION="$GITHUB_REF_NAME"
+            PKG_VERSION="${VERSION#v}"
           else
-            VERSION="${GITHUB_SHA:0:7}"
+            VERSION="dev-${GITHUB_SHA:0:7}"
+            PKG_VERSION="0.0.0"
           fi
           NAME="Inkdown-${VERSION}-${{ matrix.asset_os }}"
-          EXE="target/${{ matrix.target }}/release/${{ matrix.exe }}"
-          cp "$EXE" "${{ matrix.exe }}"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "${NAME}.zip" "${{ matrix.exe }}" README.md > /dev/null
-          else
-            zip "${NAME}.zip" "${{ matrix.exe }}" README.md
-          fi
-          ls -lh "${NAME}.zip"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "PKG_VERSION=${PKG_VERSION}" >> "$GITHUB_ENV"
           echo "NAME=${NAME}" >> "$GITHUB_ENV"
+
+      - name: Package (MSI)
+        if: runner.os == 'Windows'
+        run: |
+          cp "target/${{ matrix.target }}/release/inkdown.exe" inkdown.exe
+          dotnet tool install --global wix
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          wix build -arch x64 \
+            -d Version="${PKG_VERSION}" \
+            -d SourceDir="$(pwd -W)" \
+            -o "${NAME}.msi" \
+            packaging/windows/main.wxs
+          ls -lh "${NAME}.msi"
+          echo "PACKAGE=${NAME}.msi" >> "$GITHUB_ENV"
+
+      - name: Package (DMG)
+        if: runner.os == 'macOS'
+        run: |
+          cp "target/${{ matrix.target }}/release/inkdown" inkdown
+          mkdir -p dmgroot
+          cp inkdown dmgroot/Inkdown
+          ln -s /Applications dmgroot/Applications
+          # Ad-hoc signature: not notarized, but the app can be opened with
+          # the usual Gatekeeper right-click-open on first launch.
+          codesign --force --deep --sign - dmgroot/Inkdown || true
+          hdiutil create -volname "Inkdown" -srcfolder dmgroot \
+            -ov -format UDZO "${NAME}.dmg"
+          ls -lh "${NAME}.dmg"
+          echo "PACKAGE=${NAME}.dmg" >> "$GITHUB_ENV"
+
+      - name: Package (DEB)
+        if: runner.os == 'Linux'
+        run: |
+          cp "target/${{ matrix.target }}/release/inkdown" inkdown
+          DEB_ROOT=deb-root
+          mkdir -p "$DEB_ROOT/DEBIAN" "$DEB_ROOT/usr/bin" "$DEB_ROOT/usr/share/applications"
+          install -m 755 inkdown "$DEB_ROOT/usr/bin/inkdown"
+          cat > "$DEB_ROOT/usr/share/applications/inkdown.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Name=Inkdown
+          Comment=Markdown editor built with GPUI Kit
+          Exec=inkdown
+          Type=Application
+          Categories=Office;TextEditor;
+          Terminal=false
+          DESKTOP
+          # Resolve the shared libraries the binary actually needs into
+          # package names, so Depends stays correct across runner images.
+          DEPS=$(ldd inkdown | awk '{print $3}' | grep '^/' | sort -u \
+            | while read -r lib; do dpkg -S "$lib" 2>/dev/null | head -1 | cut -d: -f1; done \
+            | sort -u | grep -v '^inkdown$' | paste -sd, -)
+          cat > "$DEB_ROOT/DEBIAN/control" <<CONTROL
+          Package: inkdown
+          Version: ${PKG_VERSION}
+          Section: editors
+          Priority: optional
+          Architecture: amd64
+          Depends: ${DEPS:-libc6}
+          Maintainer: ice-a
+          Description: Inkdown - Markdown editor built with GPUI Kit
+           Write, preview and publish Markdown: local folders, image hosting,
+           WeChat / cnblogs publishing and AI writing in one native app.
+          CONTROL
+          dpkg-deb --build --root-owner-group "$DEB_ROOT" "${NAME}.deb"
+          ls -lh "${NAME}.deb"
+          echo "PACKAGE=${NAME}.deb" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
-          path: ${{ env.NAME }}.zip
+          path: ${{ env.PACKAGE }}
           if-no-files-found: error
 
   release:
@@ -103,7 +164,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+          gh release create "$GITHUB_REF_NAME" dist/*.msi dist/*.dmg dist/*.deb \
             --repo "$GITHUB_REPOSITORY" \
             --title "Inkdown $GITHUB_REF_NAME" \
             --generate-notes

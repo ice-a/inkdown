@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <!--
+    Built by .github/workflows/build.yml:
+      wix build -arch x64 -d Version=<x.y.z> -d SourceDir=<repo> main.wxs -o out.msi
+  -->
+  <Package
+    Name="Inkdown"
+    Manufacturer="ice-a"
+    Version="$(var.Version)"
+    UpgradeCode="7088BA2F-8EE2-4BB9-80ED-5EF8E87EC449"
+    Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Inkdown is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Inkdown">
+        <Component Id="InkdownExe" Guid="AA28E20C-039F-4C1D-BC0C-3CCDC0FBDFED">
+          <File Id="InkdownExeFile" Source="$(var.SourceDir)/inkdown.exe" KeyPath="yes">
+            <Shortcut
+              Id="StartMenuShortcut"
+              Directory="ProgramMenuDir"
+              Name="Inkdown"
+              WorkingDirectory="INSTALLFOLDER"
+              Advertise="yes" />
+          </File>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuDir" Name="Inkdown" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Inkdown">
+      <ComponentRef Id="InkdownExe" />
+    </Feature>
+  </Package>
+</Wix>

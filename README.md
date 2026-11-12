@@ -46,6 +46,18 @@ cargo build --release
 ./target/release/inkdown
 ```
 
+### 安装包
+
+每个 tag（如 `v0.1.1`）会自动构建并发布三平台安装包：
+
+| 平台 | 包 | 安装方式 |
+| --- | --- | --- |
+| Windows x64 | `.msi` | 双击安装到 Program Files，并创建开始菜单快捷方式 |
+| macOS（Apple Silicon） | `.dmg` | 拖入 Applications；未做公证签名，首次请右键 → 打开 |
+| Linux x64 | `.deb` | `sudo apt install ./Inkdown-*.deb` |
+
+Release 页面：https://github.com/ice-a/inkdown/releases
+
 ## 快捷键
 
 | 操作 | 快捷键 |

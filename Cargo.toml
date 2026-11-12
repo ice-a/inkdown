@@ -1,8 +1,10 @@
 [package]
 name = "inkdown"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Inkdown - a beautifully crafted Markdown editor built with GPUI Kit"
+authors = ["ice-a"]
+repository = "https://github.com/ice-a/inkdown"
 
 [dependencies]
 gpui-kit = { version = "0.9.1", features = ["syntect"] }
