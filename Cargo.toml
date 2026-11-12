@@ -1,0 +1,32 @@
+[package]
+name = "inkdown"
+version = "0.1.0"
+edition = "2024"
+description = "Inkdown - a beautifully crafted Markdown editor built with GPUI Kit"
+
+[dependencies]
+gpui-kit = { version = "0.9.1", features = ["syntect"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2.12", features = ["json"] }
+arboard = "3.7"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+dirs = "6"
+chrono = { version = "0.4", features = ["clock"] }
+
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package.gpui-pre]
+opt-level = 2
+[profile.dev.package.gpui-component]
+opt-level = 2
+[profile.dev.package.gpui-base]
+opt-level = 2
+[profile.dev.package.rustybuzz]
+opt-level = 2
+[profile.dev.package.taffy]
+opt-level = 2
+[profile.dev.package.ttf-parser]
+opt-level = 2

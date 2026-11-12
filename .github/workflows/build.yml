@@ -1,0 +1,103 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.asset_os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_os: windows-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_os: linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_os: macos-aarch64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same list as gpui-kit's script/install-linux.sh (Ubuntu 24.04).
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang libfontconfig-dev libwayland-dev \
+            libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
+            libssl-dev libzstd-dev libasound2-dev \
+            vulkan-validationlayers libvulkan1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      # Replaces the system ld on Linux; a no-op elsewhere.
+      - uses: rui314/setup-mold@v1
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          fi
+          NAME="Inkdown-${VERSION}-${{ matrix.asset_os }}"
+          EXE="target/${{ matrix.target }}/release/inkdown$([ "$RUNNER_OS" = "Windows" ] && echo .exe)"
+          cp "$EXE" inkdown$([ "$RUNNER_OS" = "Windows" ] && echo .exe)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "${NAME}.zip" "inkdown.exe" README.md > /dev/null
+          else
+            zip "${NAME}.zip" inkdown README.md
+          fi
+          ls -lh "${NAME}.zip"
+          echo "NAME=${NAME}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Inkdown $GITHUB_REF_NAME" \
+            --generate-notes
