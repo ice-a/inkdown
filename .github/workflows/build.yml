@@ -162,6 +162,16 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Compose release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Curated install/feature notes first, then the generated changelog.
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" \
+            -f target_commitish="$GITHUB_SHA" \
+            -q .body > generated.md
+          cat .github/release-notes.md generated.md > notes.md
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -169,4 +179,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/*.msi dist/*.dmg dist/*.deb \
             --repo "$GITHUB_REPOSITORY" \
             --title "Inkdown $GITHUB_REF_NAME" \
-            --generate-notes
+            --notes-file notes.md

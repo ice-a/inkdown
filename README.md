@@ -12,7 +12,10 @@
 
 - **编辑器**：Markdown 语法高亮、行号、软换行、内置查找、撤销/重做、格式化工具栏与快捷键。
 - **粘贴图片**：截图后直接 `Ctrl + V`，图片自动存到文档旁的 `assets/`（BMP 自动转 PNG）
-  并插入 `![](assets/…)`。
+  并插入 `![](assets/…)`；图床配置好后可自动上传并插入公开链接。
+- **预览查找**：`Ctrl + F` 在预览中高亮所有匹配并逐条跳转（编辑器内 `Ctrl + F` 仍是编辑器查找）。
+- **文档元数据**：`Ctrl + Shift + M` 打开 frontmatter 字段编辑面板，可视化增删改。
+- **拖拽打开**：把 `.md` 文件或文件夹拖进窗口即可打开。
 - **实时预览**：Markdown 渲染、表格、任务列表、代码块、引用、本地图片；可缩放。
 - **YAML frontmatter**：文章开头的 `---` 元数据块渲染为信息卡片（title/author/url…），
   不会变成两条分隔线；统计与发布时自动排除元数据。
@@ -126,6 +129,9 @@ Cookie/接口逆向方案会随前端改版失效，也可能触发风控。Inkd
 - **CloudFlare-ImgBed**：填站点根地址，如 `https://img.example.com`；上传认证码填 `authCode`，
   也可以填 API Token（`Authorization: Bearer ...`）。请求 `POST {base}/upload?returnFormat=full`。
 - **Lsky Pro**：填站点根地址和 API Token，请求 `POST {base}/api/v1/upload`。
+
+设置里的“粘贴图片自动上传”开启后，编辑器里粘贴的截图会直接上传图床并插入公开链接
+（失败时回退为本地 `assets/` 路径）。
 
 发布时勾选“上传本地图片到图床”，Inkdown 会扫描 Markdown 与 HTML 中的本地图片，
 上传后把源码里的相对路径替换为图床 URL。公众号发布还会把图片额外上传到微信素材库，

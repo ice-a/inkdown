@@ -2,6 +2,7 @@
 //! editor/preview workspace and status bar.
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::{
@@ -15,7 +16,10 @@ use gpui_kit::component::{
     },
     menu::{DropdownMenu as _, PopupMenuItem},
     resizable::{h_resizable, resizable_panel},
-    text::{FrontmatterPlugin, MarkdownExtensions, SelectionFormat, TextView, TextViewState},
+    text::{
+        FrontmatterPlugin, MarkdownExtensions, RangeHighlight, SelectionFormat, TextView,
+        TextViewState,
+    },
     v_flex,
 };
 use gpui_kit::assets::IconName;
@@ -47,6 +51,10 @@ pub struct InkdownApp {
     outline: Vec<Heading>,
     stats: Stats,
     preview_zoom: f32,
+    preview_find_open: bool,
+    preview_find: Entity<InputState>,
+    preview_matches: Vec<Range<usize>>,
+    preview_current: usize,
     notice: Option<String>,
     _subscriptions: Vec<Subscription>,
 
@@ -67,6 +75,9 @@ pub struct InkdownApp {
     /// Set when a close was refused for unsaved documents; holds the count.
     close_confirm: Option<usize>,
     quit_confirmed: bool,
+
+    meta_open: bool,
+    meta_fields: Vec<(Entity<InputState>, Entity<InputState>)>,
 }
 
 /// Where the AI result lands.
@@ -99,6 +110,7 @@ impl InkdownApp {
                 .placeholder("开始写下你的想法…")
         });
         let preview = cx.new(|cx| TextViewState::markdown(&first, cx));
+        let preview_find = cx.new(|cx| InputState::new(window, cx).placeholder("在预览中查找"));
         let outline = doc::outline(&first);
         let stats = doc::stats(&first);
 
@@ -133,6 +145,10 @@ impl InkdownApp {
             outline,
             stats,
             preview_zoom: 1.0,
+            preview_find_open: false,
+            preview_find: preview_find.clone(),
+            preview_matches: Vec::new(),
+            preview_current: 0,
             notice: None,
             _subscriptions: Vec::new(),
             workspace,
@@ -150,6 +166,8 @@ impl InkdownApp {
             action_busy: None,
             close_confirm: None,
             quit_confirmed: false,
+            meta_open: false,
+            meta_fields: Vec::new(),
         };
 
         let change_sub = cx.subscribe(&editor, |this, _editor, event, cx| {
@@ -160,8 +178,14 @@ impl InkdownApp {
         // The status bar and the outline follow the caret, which can move
         // without changing the text, so listen to every editor notification.
         let cursor_sub = cx.observe(&editor, |_, _, cx| cx.notify());
+        let find_sub = cx.subscribe(&preview_find, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.refresh_preview_find(true, cx);
+            }
+        });
         this._subscriptions.push(change_sub);
         this._subscriptions.push(cursor_sub);
+        this._subscriptions.push(find_sub);
 
         let focus = this.editor.read(cx).focus_handle(cx);
         window.defer(cx, move |window, cx| focus.focus(window, cx));
@@ -203,6 +227,9 @@ impl InkdownApp {
             .update(cx, |state, cx| state.set_text(&value, cx));
         self.outline = doc::outline(&value);
         self.stats = doc::stats(&value);
+        if self.preview_find_open {
+            self.refresh_preview_find(false, cx);
+        }
         self.notice = None;
         cx.notify();
     }
@@ -693,6 +720,12 @@ impl InkdownApp {
                 )
                 .separator()
                 .item(
+                    PopupMenuItem::new("文档元数据…")
+                        .icon(IconName::Type)
+                        .action(Box::new(EditMetadata)),
+                )
+                .separator()
+                .item(
                     PopupMenuItem::new("引用")
                         .icon(IconName::Quote)
                         .action(Box::new(FormatQuote)),
@@ -743,6 +776,7 @@ impl InkdownApp {
                         .action(Box::new(ViewPreview)),
                 )
                 .separator()
+                .item(PopupMenuItem::new("在预览中查找").action(Box::new(PreviewFind)))
                 .item(
                     PopupMenuItem::new("显示侧边栏")
                         .checked(sidebar)
@@ -1777,6 +1811,25 @@ impl InkdownApp {
         }
     }
 
+    fn open_dropped(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        let mut opened = 0usize;
+        for path in paths.paths() {
+            if path.is_dir() {
+                self.open_folder_at(path.clone(), window, cx);
+                opened += 1;
+            } else if workspace::is_markdown(path)
+                && let Ok(content) = std::fs::read_to_string(path)
+            {
+                self.open_path(path.clone(), content, window, cx);
+                opened += 1;
+            }
+        }
+        if opened == 0 {
+            self.notice = Some("拖入的内容里没有 Markdown 文件".to_string());
+            cx.notify();
+        }
+    }
+
     /// Save a clipboard image next to the document and insert its Markdown.
     ///
     /// Clipboard images often arrive as BMP (screenshot tools), which neither
@@ -1820,20 +1873,66 @@ impl InkdownApp {
             chrono::Local::now().format("%Y%m%d-%H%M%S"),
             extension
         );
-        match std::fs::write(assets.join(&name), &bytes) {
-            Ok(()) => {
-                let relative = format!("assets/{name}");
-                self.editor.update(cx, |state, cx| {
-                    state.insert(format!("![]({relative})"), window, cx);
-                });
-                self.after_edit(window, cx);
-                self.notice = Some(format!("图片已保存到 {relative}"));
-            }
-            Err(error) => {
-                self.notice = Some(format!("保存图片失败：{error}"));
-            }
+        let path = assets.join(&name);
+        if let Err(error) = std::fs::write(&path, &bytes) {
+            self.notice = Some(format!("保存图片失败：{error}"));
+            cx.notify();
+            return;
         }
+
+        let relative = format!("assets/{name}");
+        let host = cx.global::<config::AppConfig>().image_host.clone();
+        if !(host.upload_on_paste && host.kind != config::ImageHostKind::None) {
+            self.editor.update(cx, |state, cx| {
+                state.insert(format!("![]({relative})"), window, cx);
+            });
+            self.after_edit(window, cx);
+            self.notice = Some(format!("图片已保存到 {relative}"));
+            cx.notify();
+            return;
+        }
+
+        self.notice = Some("图片已保存，正在上传图床…".to_string());
         cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { imagebed::upload_file(&host, &path) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                let markdown = match &result {
+                    Ok(url) => format!("![]({url})"),
+                    Err(_) => format!("![]({relative})"),
+                };
+                this.editor
+                    .update(cx, |state, cx| state.insert(markdown, window, cx));
+                this.after_edit(window, cx);
+                this.notice = Some(match result {
+                    Ok(url) => format!("图片已上传：{url}"),
+                    Err(error) => format!("上传失败，使用本地图片：{error}"),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn on_edit_metadata(&mut self, _: &EditMetadata, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_metadata(window, cx);
+    }
+
+    fn on_preview_find(&mut self, _: &PreviewFind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_open
+            || self.publish_open
+            || self.ai_open
+            || self.prompt.is_some()
+            || self.close_confirm.is_some()
+            || self.meta_open
+        {
+            return;
+        }
+        self.toggle_preview_find(window, cx);
     }
 
     fn on_format_image(&mut self, _: &FormatImage, window: &mut Window, cx: &mut Context<Self>) {
@@ -1847,6 +1946,327 @@ impl InkdownApp {
                 cx.notify();
             }
         }
+    }
+
+    // ---- preview find ---------------------------------------------------
+
+    fn toggle_preview_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview_find_open {
+            self.close_preview_find(window, cx);
+            return;
+        }
+        if self.view_mode == ViewMode::Write {
+            self.view_mode = ViewMode::Split;
+        }
+        self.preview_find_open = true;
+        let focus = self.preview_find.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        self.refresh_preview_find(true, cx);
+        cx.notify();
+    }
+
+    fn close_preview_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.preview_find_open {
+            return;
+        }
+        self.preview_find_open = false;
+        self.preview_matches.clear();
+        self.preview_current = 0;
+        self.preview
+            .update(cx, |state, cx| state.clear_range_highlights(cx));
+        self.focus_editor(window, cx);
+        cx.notify();
+    }
+
+    fn refresh_preview_find(&mut self, reveal: bool, cx: &mut Context<Self>) {
+        if !self.preview_find_open {
+            return;
+        }
+        let query = self.preview_find.read(cx).value().to_string();
+        let rendered = self.preview.read(cx).rendered_text();
+        let text = rendered.as_str();
+        self.preview_matches = if query.is_empty() {
+            Vec::new()
+        } else {
+            text.match_indices(query.as_str())
+                .map(|(start, _)| start..start + query.len())
+                .collect()
+        };
+        self.preview_current = 0;
+        self.paint_preview_find(reveal, cx);
+    }
+
+    fn paint_preview_find(&mut self, reveal: bool, cx: &mut Context<Self>) {
+        let strong = cx.theme().warning;
+        let weak = cx.theme().warning.opacity(0.35);
+        let highlights = self
+            .preview_matches
+            .iter()
+            .enumerate()
+            .map(|(index, range)| {
+                RangeHighlight::new(
+                    range.clone(),
+                    if index == self.preview_current {
+                        strong
+                    } else {
+                        weak
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let current = self.preview_matches.get(self.preview_current).cloned();
+        self.preview.update(cx, |state, cx| {
+            let _ = state.set_range_highlights(highlights, cx);
+            if reveal && let Some(range) = current {
+                let _ = state.reveal_range(range, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn preview_find_next(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.preview_matches.len();
+        if count == 0 {
+            return;
+        }
+        self.preview_current = if forward {
+            (self.preview_current + 1) % count
+        } else {
+            (self.preview_current + count - 1) % count
+        };
+        self.paint_preview_find(true, cx);
+    }
+
+    fn preview_find_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.preview_matches.len();
+        let current = if count == 0 { 0 } else { self.preview_current + 1 };
+        h_flex()
+            .h(px(38.))
+            .flex_shrink_0()
+            .px_3()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted.opacity(0.5))
+            .child(Input::new(&self.preview_find).xsmall().flex_1())
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{current}/{count}")),
+            )
+            .child(
+                Button::new("preview-find-prev")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronUp)
+                    .tooltip("上一个")
+                    .on_click(cx.listener(|this, _, _, cx| this.preview_find_next(false, cx))),
+            )
+            .child(
+                Button::new("preview-find-next")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronDown)
+                    .tooltip("下一个")
+                    .on_click(cx.listener(|this, _, _, cx| this.preview_find_next(true, cx))),
+            )
+            .child(
+                Button::new("preview-find-close")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::X)
+                    .tooltip("关闭查找")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_preview_find(window, cx)
+                    })),
+            )
+    }
+
+    // ---- document metadata ----------------------------------------------
+
+    fn open_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let source = self.editor.read(cx).value().to_string();
+        let mut pairs = Vec::new();
+        for field in doc::frontmatter_fields(&source) {
+            let key = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(field.key)
+                    .placeholder("字段名")
+            });
+            let value = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(field.value)
+                    .placeholder("值")
+            });
+            pairs.push((key, value));
+        }
+        if pairs.is_empty() {
+            let key = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value("title")
+                    .placeholder("字段名")
+            });
+            let value = cx.new(|cx| InputState::new(window, cx).placeholder("值"));
+            pairs.push((key, value));
+        }
+        self.meta_fields = pairs;
+        self.meta_open = true;
+        cx.notify();
+    }
+
+    fn add_meta_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = cx.new(|cx| InputState::new(window, cx).placeholder("字段名"));
+        let value = cx.new(|cx| InputState::new(window, cx).placeholder("值"));
+        self.meta_fields.push((key, value));
+        cx.notify();
+    }
+
+    fn save_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fields: Vec<(String, String)> = self
+            .meta_fields
+            .iter()
+            .filter_map(|(key, value)| {
+                let key = key.read(cx).value().trim().to_string();
+                (!key.is_empty()).then(|| (key, value.read(cx).value().to_string()))
+            })
+            .collect();
+        let source = self.editor.read(cx).value().to_string();
+        let updated = doc::set_frontmatter_fields(&source, &fields);
+        if updated != source {
+            self.editor
+                .update(cx, |state, cx| state.set_value(&updated, window, cx));
+            self.sync_editor(cx);
+            self.notice = Some("元数据已更新".to_string());
+        }
+        self.meta_open = false;
+        cx.notify();
+    }
+
+    fn meta_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.modal_shell("meta-overlay", cx)
+            .child(
+                v_flex()
+                    .w(px(620.))
+                    .h(relative(0.8))
+                    .max_h(px(560.))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .overflow_hidden()
+                    .occlude()
+                    .child(
+                        h_flex()
+                            .h(px(56.))
+                            .flex_shrink_0()
+                            .px_5()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                v_flex()
+                                    .gap_0()
+                                    .child(div().text_base().font_semibold().child("文档元数据"))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("写入文档开头的 YAML frontmatter，留空的字段不会保存"),
+                                    ),
+                            )
+                            .child(
+                                Button::new("meta-close")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::X)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.meta_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .id("meta-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p_5()
+                            .gap_2()
+                            .children(
+                                (0..self.meta_fields.len())
+                                    .map(|index| {
+                                        let (key, value) = &self.meta_fields[index];
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(Input::new(key).xsmall().w(px(170.)))
+                                            .child(Input::new(value).xsmall().flex_1())
+                                            .child(
+                                                Button::new(("meta-remove", index))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::Trash)
+                                                    .tooltip("删除字段")
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            if index < this.meta_fields.len() {
+                                                                this.meta_fields.remove(index);
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .into_any_element()
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .h(px(58.))
+                            .flex_shrink_0()
+                            .px_5()
+                            .gap_2()
+                            .items_center()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                Button::new("meta-add")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Plus)
+                                    .label("添加字段")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_meta_field(window, cx)
+                                    })),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("meta-cancel")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("取消")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.meta_open = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("meta-save")
+                                    .primary()
+                                    .xsmall()
+                                    .label("保存")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_metadata(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     // ---- AI -------------------------------------------------------------
@@ -2826,6 +3246,11 @@ impl InkdownApp {
             cx.notify();
             return;
         }
+        if self.meta_open {
+            self.meta_open = false;
+            cx.notify();
+            return;
+        }
         if self.settings_open {
             self.close_settings(cx);
         }
@@ -3102,7 +3527,19 @@ impl InkdownApp {
                                                 this.test_image_host(window, cx)
                                             })),
                                     )
-                                }),
+                                })
+                                .child(self.toggle_row(
+                                    "image-upload-on-paste",
+                                    "粘贴图片自动上传",
+                                    "编辑器里粘贴截图时直接上传图床，并插入公开链接",
+                                    self.settings.image_upload_on_paste,
+                                    true,
+                                    cx,
+                                    |this| {
+                                        this.settings.image_upload_on_paste =
+                                            !this.settings.image_upload_on_paste;
+                                    },
+                                )),
                         )
                         .child(
                             v_flex()
@@ -4148,6 +4585,17 @@ impl InkdownApp {
                         .gap_1()
                         .items_center()
                         .child(
+                            Button::new("preview-find-toggle")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Search)
+                                .tooltip("在预览中查找 · Ctrl+F")
+                                .selected(self.preview_find_open)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_preview_find(window, cx)
+                                })),
+                        )
+                        .child(
                             Button::new("zoom-out")
                                 .ghost()
                                 .xsmall()
@@ -4235,6 +4683,9 @@ impl InkdownApp {
             .bg(cx.theme().popover)
             .overflow_hidden()
             .child(self.panel_header(true, cx))
+            .when(self.preview_find_open, |this| {
+                this.child(self.preview_find_bar(cx))
+            })
             .child(
                 div()
                     .flex_1()
@@ -4629,6 +5080,7 @@ impl Render for InkdownApp {
             .when(self.close_confirm.is_some(), |this| {
                 this.child(self.close_confirm_modal(cx))
             })
+            .when(self.meta_open, |this| this.child(self.meta_modal(cx)))
             .when(self.prompt.is_some(), |this| this.child(self.prompt_modal(cx)))
             .on_action(cx.listener(Self::on_new))
             .on_action(cx.listener(Self::on_open))
@@ -4660,6 +5112,8 @@ impl Render for InkdownApp {
             .on_action(cx.listener(Self::on_format_code_block))
             .on_action(cx.listener(Self::on_format_link))
             .on_action(cx.listener(Self::on_format_image))
+            .on_action(cx.listener(Self::on_preview_find))
+            .on_action(cx.listener(Self::on_edit_metadata))
             .on_action(cx.listener(Self::on_format_h1))
             .on_action(cx.listener(Self::on_format_h2))
             .on_action(cx.listener(Self::on_format_quote))
@@ -4667,6 +5121,11 @@ impl Render for InkdownApp {
             .on_action(cx.listener(Self::on_format_ordered))
             .on_action(cx.listener(Self::on_format_table))
             .on_action(cx.listener(Self::on_format_divider))
+            .on_drop(cx.listener(
+                |this, paths: &ExternalPaths, window, cx| {
+                    this.open_dropped(paths, window, cx)
+                },
+            ))
     }
 }
 

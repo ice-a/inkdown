@@ -48,6 +48,8 @@ fn main() {
                 KeyBinding::new("ctrl-e", FormatInlineCode, None),
                 KeyBinding::new("ctrl-k", FormatLink, None),
                 KeyBinding::new("ctrl-shift-i", FormatImage, None),
+                KeyBinding::new("ctrl-f", PreviewFind, None),
+                KeyBinding::new("ctrl-shift-m", EditMetadata, None),
                 KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
                 KeyBinding::new("ctrl-shift-b", ToggleSidebar, None),
                 KeyBinding::new("ctrl-1", ViewWrite, None),

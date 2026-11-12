@@ -39,6 +39,7 @@ pub struct SettingsForm {
     pub image_url: Entity<InputState>,
     pub image_auth: Entity<InputState>,
     pub image_token: Entity<InputState>,
+    pub image_upload_on_paste: bool,
 
     pub wx_appid: Entity<InputState>,
     pub wx_secret: Entity<InputState>,
@@ -81,6 +82,7 @@ impl SettingsForm {
             image_url: input(window, cx, "https://img.example.com", false, &config.image_host.base_url),
             image_auth: input(window, cx, "图床 authCode（可选）", false, &config.image_host.auth_code),
             image_token: input(window, cx, "API Token（可选）", true, &config.image_host.token),
+            image_upload_on_paste: config.image_host.upload_on_paste,
             wx_appid: input(window, cx, "公众号 AppID", false, &config.wechat.app_id),
             wx_secret: input(window, cx, "AppSecret", true, &config.wechat.app_secret),
             wx_author: input(window, cx, "作者名", false, &config.wechat.author),
@@ -151,6 +153,7 @@ impl SettingsForm {
             base_url: self.image_url.read(cx).value().trim().to_string(),
             auth_code: self.image_auth.read(cx).value().trim().to_string(),
             token: self.image_token.read(cx).value().trim().to_string(),
+            upload_on_paste: self.image_upload_on_paste,
         }
     }
 

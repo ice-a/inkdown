@@ -301,6 +301,7 @@ mod tests {
             base_url: base.clone(),
             auth_code: "abc 123".to_string(),
             token: String::new(),
+            upload_on_paste: true,
         };
         let url = upload_bytes(&cf, "a.png", TEST_PNG).unwrap();
         assert_eq!(url, "http://localhost/cf.png");
@@ -310,6 +311,7 @@ mod tests {
             base_url: base,
             auth_code: String::new(),
             token: "token".to_string(),
+            upload_on_paste: true,
         };
         let url = upload_bytes(&lsky, "b.png", TEST_PNG).unwrap();
         assert_eq!(url, "http://localhost/lsky.png");

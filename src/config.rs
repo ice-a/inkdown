@@ -15,7 +15,11 @@ pub enum ImageHostKind {
     Lsky,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageHostConfig {
     pub kind: ImageHostKind,
@@ -25,6 +29,22 @@ pub struct ImageHostConfig {
     pub auth_code: String,
     /// API token (CloudFlare-ImgBed bearer token or Lsky Pro token).
     pub token: String,
+    /// Upload an image pasted into the editor straight to the host and insert
+    /// its public URL instead of the local assets path.
+    #[serde(default = "default_true")]
+    pub upload_on_paste: bool,
+}
+
+impl Default for ImageHostConfig {
+    fn default() -> Self {
+        Self {
+            kind: ImageHostKind::None,
+            base_url: String::new(),
+            auth_code: String::new(),
+            token: String::new(),
+            upload_on_paste: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

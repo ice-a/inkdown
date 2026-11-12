@@ -88,6 +88,64 @@ pub fn split_frontmatter(source: &str) -> (Option<&str>, &str) {
     (None, source)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontmatterField {
+    pub key: String,
+    pub value: String,
+}
+
+/// Simple `key: value` entries from the frontmatter block. Nested YAML and
+/// block scalars are left to the raw text and ignored here.
+pub fn frontmatter_fields(source: &str) -> Vec<FrontmatterField> {
+    let (Some(front), _) = split_frontmatter(source) else {
+        return Vec::new();
+    };
+    let mut fields = Vec::new();
+    for line in front.lines().skip(1) {
+        if line.trim_end() == "---" {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim();
+            if !key.is_empty() {
+                fields.push(FrontmatterField {
+                    key: key.to_string(),
+                    value: value.trim().to_string(),
+                });
+            }
+        }
+    }
+    fields
+}
+
+/// Rewrite `source` with a frontmatter block built from `fields`.
+pub fn set_frontmatter_fields(source: &str, fields: &[(String, String)]) -> String {
+    let (_, body) = split_frontmatter(source);
+    if fields.iter().all(|(key, _)| key.trim().is_empty()) {
+        return body.to_string();
+    }
+    let mut out = String::from("---\n");
+    for (key, value) in fields {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        out.push_str(key);
+        out.push(':');
+        if !value.trim().is_empty() {
+            out.push(' ');
+            out.push_str(value.trim());
+        }
+        out.push('\n');
+    }
+    out.push_str("---\n");
+    out.push_str(body);
+    out
+}
+
 pub fn outline(source: &str) -> Vec<Heading> {
     let (frontmatter, body) = split_frontmatter(source);
     let base = frontmatter.map(str::len).unwrap_or(0);
@@ -497,6 +555,26 @@ mod tests {
         assert_eq!(headings[0].title, "正文");
         assert_eq!(headings[0].offset, front.len());
         assert_eq!(stats(source).lines, source.lines().count());
+    }
+
+
+    #[test]
+    fn edits_frontmatter_fields() {
+        let source = "---\ntitle: 逆向\nauthor: \n---\n# 正文\n";
+        let fields = frontmatter_fields(source);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].key, "title");
+        assert_eq!(fields[0].value, "逆向");
+        let updated = set_frontmatter_fields(
+            source,
+            &[
+                ("title".to_string(), "新标题".to_string()),
+                ("url".to_string(), "https://example.com".to_string()),
+            ],
+        );
+        assert!(updated.starts_with("---\ntitle: 新标题\nurl: https://example.com\n---\n"));
+        assert!(updated.ends_with("# 正文\n"));
+        assert_eq!(set_frontmatter_fields(source, &[]), "# 正文\n");
     }
 
     #[test]

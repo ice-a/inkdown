@@ -30,6 +30,8 @@ actions!(
         FormatCodeBlock,
         FormatLink,
         FormatImage,
+        PreviewFind,
+        EditMetadata,
         FormatHeading1,
         FormatHeading2,
         FormatQuote,
