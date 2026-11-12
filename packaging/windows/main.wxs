@@ -11,7 +11,10 @@
     UpgradeCode="7C3E9A52-6B4D-4C8F-9A21-58D7F0B2E6A1"
     Scope="perUser">
     <!-- Force true per-user semantics: files under %LOCALAPPDATA% and the
-         Add/Remove entry under HKCU, with no elevation prompt. -->
+         Add/Remove entry under HKCU, with no elevation prompt.
+         The package is built with -arch x86 because Windows Installer does
+         not allow per-user installs of 64-bit packages; the payload stays
+         64-bit through Bitness="always64" on the component. -->
     <Property Id="ALLUSERS" Value="2" />
     <Property Id="MSIINSTALLPERUSER" Value="1" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of Inkdown is already installed." />
@@ -22,7 +25,7 @@
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">
       <Directory Id="INSTALLFOLDER" Name="Inkdown">
-        <Component Id="InkdownExe" Guid="AA28E20C-039F-4C1D-BC0C-3CCDC0FBDFED">
+        <Component Id="InkdownExe" Guid="AA28E20C-039F-4C1D-BC0C-3CCDC0FBDFED" Bitness="always64">
           <File Id="InkdownExeFile" Source="$(var.SourceDir)/inkdown.exe" KeyPath="yes">
             <Shortcut
               Id="StartMenuShortcut"

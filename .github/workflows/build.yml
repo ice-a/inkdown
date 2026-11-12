@@ -84,7 +84,7 @@ jobs:
           # and supports the v4 schema used by packaging/windows/main.wxs.
           dotnet tool install --global wix --version 5.*
           export PATH="$PATH:$HOME/.dotnet/tools"
-          wix build -arch x64 \
+          wix build -arch x86 \
             -d Version="${PKG_VERSION}" \
             -d SourceDir="$(pwd -W)" \
             -o "${NAME}.msi" \
