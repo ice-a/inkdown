@@ -80,7 +80,9 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           cp "target/${{ matrix.target }}/release/inkdown.exe" inkdown.exe
-          dotnet tool install --global wix
+          # WiX 7 requires accepting the OSMF EULA; 5.x is Apache-licensed
+          # and supports the v4 schema used by packaging/windows/main.wxs.
+          dotnet tool install --global wix --version 5.*
           export PATH="$PATH:$HOME/.dotnet/tools"
           wix build -arch x64 \
             -d Version="${PKG_VERSION}" \
