@@ -2,6 +2,7 @@
 //! directory. Secrets live here in plain text; the settings panel says so.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use gpui_kit::{App, Global};
 use serde::{Deserialize, Serialize};
@@ -146,23 +147,88 @@ pub struct AppConfig {
     pub backup: BackupConfig,
     /// Last opened folder, restored on the next launch.
     pub last_folder: Option<String>,
+    /// The file that was active when the app last closed, restored on launch.
+    pub last_document: Option<String>,
+    /// Recently opened Markdown files, newest first.
+    pub recent_files: Vec<String>,
     /// Restore the dark palette on the next launch.
     pub dark_mode: bool,
 }
 
 impl Global for AppConfig {}
 
-pub fn config_path() -> PathBuf {
+/// Optional paths written next to the executable by the Windows installer.
+/// They let the installer choose the config and data locations while keeping
+/// the portable/zip build working with the platform defaults.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct InstallPaths {
+    #[serde(default)]
+    config_dir: String,
+    #[serde(default)]
+    data_dir: String,
+}
+
+fn parse_install_paths(contents: &str) -> InstallPaths {
+    serde_json::from_str(contents.trim_start_matches('\u{feff}')).unwrap_or_default()
+}
+
+fn install_paths() -> &'static InstallPaths {
+    static PATHS: OnceLock<InstallPaths> = OnceLock::new();
+    PATHS.get_or_init(|| {
+        let Some(exe) = std::env::current_exe().ok() else {
+            return InstallPaths::default();
+        };
+        let Some(parent) = exe.parent() else {
+            return InstallPaths::default();
+        };
+        std::fs::read_to_string(parent.join("install.json"))
+            .map(|contents| parse_install_paths(&contents))
+            .unwrap_or_default()
+    })
+}
+
+fn env_dir(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Directory holding `config.json`. The installer can override it; the
+/// environment variable wins so tests and portable setups stay controllable.
+pub fn config_dir() -> PathBuf {
+    if let Some(dir) = env_dir("INKDOWN_CONFIG_DIR") {
+        return dir;
+    }
+    let install = install_paths();
+    if !install.config_dir.trim().is_empty() {
+        return PathBuf::from(install.config_dir.trim());
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Inkdown")
-        .join("config.json")
+}
+
+/// Directory for generated data (backups, pasted assets without a document
+/// location). `None` means backups follow the config directory.
+pub fn data_dir() -> Option<PathBuf> {
+    if let Some(dir) = env_dir("INKDOWN_DATA_DIR") {
+        return Some(dir);
+    }
+    let install = install_paths();
+    (!install.data_dir.trim().is_empty()).then(|| PathBuf::from(install.data_dir.trim()))
+}
+
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.json")
 }
 
 pub fn load() -> AppConfig {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Ok(contents) => {
+            // Notepad and some editors prepend a UTF-8 BOM; serde rejects it.
+            serde_json::from_str(contents.trim_start_matches('\u{feff}')).unwrap_or_default()
+        }
         Err(_) => AppConfig::default(),
     }
 }
@@ -188,11 +254,31 @@ pub fn init(cx: &mut App) {
 /// Default folder for archives and other generated files.
 pub fn default_backup_dir(config: &AppConfig) -> PathBuf {
     if config.backup.directory.trim().is_empty() {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Inkdown")
-            .join("backups")
+        data_dir().unwrap_or_else(config_dir).join("backups")
     } else {
         PathBuf::from(config.backup.directory.trim())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_installer_paths_and_tolerates_bad_json() {
+        let parsed = parse_install_paths(
+            r#"{"version":"0.1.5","data_dir":"D:/Inkdown data","config_dir":"C:/Users/lee/Inkdown/config"}"#,
+        );
+        assert_eq!(parsed.data_dir, "D:/Inkdown data");
+        assert_eq!(parsed.config_dir, "C:/Users/lee/Inkdown/config");
+
+        let empty = parse_install_paths("not json");
+        assert!(empty.data_dir.is_empty());
+        assert!(empty.config_dir.is_empty());
+
+        let bom = "\u{feff}{\"data_dir\":\"D:/data\",\"config_dir\":\"C:/config\"}";
+        let parsed = parse_install_paths(bom);
+        assert_eq!(parsed.data_dir, "D:/data");
+        assert_eq!(parsed.config_dir, "C:/config");
     }
 }

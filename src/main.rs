@@ -1,11 +1,14 @@
-// Release builds are GUI apps: without this, Windows opens a console window
-// next to the app and closing it kills the process.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Windows GUI apps must not carry the console subsystem, otherwise Explorer
+// opens a cmd window next to the app and closing it kills the process. This
+// applies to debug builds too; use `cargo run --features console` when you
+// need stdout/stderr in a terminal.
+#![cfg_attr(all(windows, not(feature = "console")), windows_subsystem = "windows")]
 
 mod actions;
 mod ai;
 mod app;
 mod backup;
+mod commands;
 mod config;
 mod doc;
 mod git;
@@ -35,6 +38,7 @@ fn main() {
 
             cx.bind_keys([
                 KeyBinding::new("ctrl-n", NewDocument, None),
+                KeyBinding::new("ctrl-shift-n", NewFromTemplate, None),
                 KeyBinding::new("ctrl-o", OpenDocument, None),
                 KeyBinding::new("ctrl-shift-o", OpenFolder, None),
                 KeyBinding::new("ctrl-shift-p", PublishArticle, None),
@@ -61,12 +65,27 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1360.), px(860.)), cx)),
                 window_min_size: Some(size(px(900.), px(600.))),
+                app_id: Some("inkdown".into()),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Inkdown".into()),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(9.), px(9.))),
                 }),
                 ..TitleBar::window_options()
+            };
+
+            // The Windows icon is a PE resource (see assets/windows.rc) and the
+            // macOS icon lives in the .app bundle. Only X11 exposes a runtime
+            // window icon, so decode the PNG there.
+            #[cfg(target_os = "linux")]
+            let options = {
+                let mut options = options;
+                if let Ok(image) =
+                    image::load_from_memory(include_bytes!("../assets/icon/inkdown-256.png"))
+                {
+                    options.icon = Some(std::sync::Arc::new(image.into_rgba8()));
+                }
+                options
             };
 
             gpui_kit::open_window(options, cx, |window, cx| {

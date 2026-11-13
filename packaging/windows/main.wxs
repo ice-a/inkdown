@@ -17,6 +17,8 @@
          64-bit through Bitness="always64" on the component. -->
     <Property Id="ALLUSERS" Value="2" />
     <Property Id="MSIINSTALLPERUSER" Value="1" />
+    <Icon Id="ApplicationIcon" SourceFile="$(var.SourceDir)/assets/icon/inkdown.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ApplicationIcon" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of Inkdown is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
@@ -32,6 +34,8 @@
               Directory="ProgramMenuDir"
               Name="Inkdown"
               WorkingDirectory="INSTALLFOLDER"
+              Icon="ApplicationIcon"
+              IconIndex="0"
               Advertise="yes" />
           </File>
         </Component>

@@ -75,6 +75,7 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "PKG_VERSION=${PKG_VERSION}" >> "$GITHUB_ENV"
           echo "NAME=${NAME}" >> "$GITHUB_ENV"
+          echo "PACKAGE_SETUP=" >> "$GITHUB_ENV"
 
       - name: Package (MSI)
         if: runner.os == 'Windows'
@@ -92,16 +93,57 @@ jobs:
           ls -lh "${NAME}.msi"
           echo "PACKAGE=${NAME}.msi" >> "$GITHUB_ENV"
 
+      - name: Package (guided Setup.exe)
+        if: runner.os == 'Windows'
+        run: |
+          MAKENSIS="/c/Program Files (x86)/NSIS/makensis.exe"
+          if [ ! -f "$MAKENSIS" ]; then
+            choco install nsis --no-progress -y
+          fi
+          # /D arguments are Windows paths; stop Git Bash from rewriting them.
+          ROOT_WIN="$(cygpath -w "$PWD")"
+          OUT_WIN="$(cygpath -w "$PWD/${NAME}-setup.exe")"
+          MSYS_NO_PATHCONV=1 "$MAKENSIS" \
+            /DVERSION="${PKG_VERSION}" \
+            /DROOT="$ROOT_WIN" \
+            /DOUTFILE="$OUT_WIN" \
+            packaging/windows/setup.nsi
+          ls -lh "${NAME}-setup.exe"
+          echo "PACKAGE_SETUP=${NAME}-setup.exe" >> "$GITHUB_ENV"
+
       - name: Package (DMG)
         if: runner.os == 'macOS'
         run: |
-          cp "target/${{ matrix.target }}/release/inkdown" inkdown
+          APP="Inkdown.app"
+          rm -rf "$APP" dmgroot
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/inkdown" "$APP/Contents/MacOS/inkdown"
+          chmod +x "$APP/Contents/MacOS/inkdown"
+          cp assets/icon/inkdown.icns "$APP/Contents/Resources/inkdown.icns"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Inkdown</string>
+            <key>CFBundleDisplayName</key><string>Inkdown</string>
+            <key>CFBundleIdentifier</key><string>com.ice-a.inkdown</string>
+            <key>CFBundleExecutable</key><string>inkdown</string>
+            <key>CFBundleIconFile</key><string>inkdown.icns</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${PKG_VERSION}</string>
+            <key>CFBundleVersion</key><string>${PKG_VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # Ad-hoc signature: not notarized, but Gatekeeper can offer the
+          # usual right-click-open path on first launch.
+          codesign --force --deep --sign - "$APP" || true
           mkdir -p dmgroot
-          cp inkdown dmgroot/Inkdown
+          cp -R "$APP" dmgroot/
           ln -s /Applications dmgroot/Applications
-          # Ad-hoc signature: not notarized, but the app can be opened with
-          # the usual Gatekeeper right-click-open on first launch.
-          codesign --force --deep --sign - dmgroot/Inkdown || true
           hdiutil create -volname "Inkdown" -srcfolder dmgroot \
             -ov -format UDZO "${NAME}.dmg"
           ls -lh "${NAME}.dmg"
@@ -112,15 +154,25 @@ jobs:
         run: |
           cp "target/${{ matrix.target }}/release/inkdown" inkdown
           DEB_ROOT=deb-root
-          mkdir -p "$DEB_ROOT/DEBIAN" "$DEB_ROOT/usr/bin" "$DEB_ROOT/usr/share/applications"
+          mkdir -p "$DEB_ROOT/DEBIAN" "$DEB_ROOT/usr/bin" \
+            "$DEB_ROOT/usr/share/applications" "$DEB_ROOT/usr/share/pixmaps"
           install -m 755 inkdown "$DEB_ROOT/usr/bin/inkdown"
+          for size in 16 24 32 48 64 128 256 512; do
+            install -Dm644 "assets/icon/inkdown-${size}.png" \
+              "$DEB_ROOT/usr/share/icons/hicolor/${size}x${size}/apps/inkdown.png"
+          done
+          install -Dm644 assets/icon/inkdown-512.png \
+            "$DEB_ROOT/usr/share/pixmaps/inkdown.png"
           cat > "$DEB_ROOT/usr/share/applications/inkdown.desktop" <<'DESKTOP'
           [Desktop Entry]
           Name=Inkdown
           Comment=Markdown editor built with GPUI Kit
           Exec=inkdown
+          Icon=inkdown
           Type=Application
           Categories=Office;TextEditor;
+          Keywords=markdown;editor;text;
+          StartupWMClass=inkdown
           Terminal=false
           DESKTOP
           # Resolve the shared libraries the binary actually needs into
@@ -150,6 +202,13 @@ jobs:
           path: ${{ env.PACKAGE }}
           if-no-files-found: error
 
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: ${{ env.NAME }}-setup
+          path: ${{ env.PACKAGE_SETUP }}
+          if-no-files-found: error
+
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -177,7 +236,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.msi dist/*.dmg dist/*.deb \
+          gh release create "$GITHUB_REF_NAME" dist/*.msi dist/*.dmg dist/*.deb dist/*.exe \
             --repo "$GITHUB_REPOSITORY" \
             --title "Inkdown $GITHUB_REF_NAME" \
             --notes-file notes.md

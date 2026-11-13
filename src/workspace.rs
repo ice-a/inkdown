@@ -207,7 +207,6 @@ pub fn unique_dir_path(dir: &Path, stem: &str) -> PathBuf {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,7 +216,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "inkdown-tree-test-{}-{}",
             std::process::id(),
-            chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
         ));
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("a.md"), "# a").unwrap();

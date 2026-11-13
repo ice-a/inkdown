@@ -3210,11 +3210,12 @@ dependencies = [
 
 [[package]]
 name = "inkdown"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "arboard",
  "chrono",
  "dirs 6.0.0",
+ "embed-resource",
  "gpui-kit",
  "image",
  "pulldown-cmark",

@@ -1,6 +1,6 @@
 [package]
 name = "inkdown"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Inkdown - a beautifully crafted Markdown editor built with GPUI Kit"
 authors = ["ice-a"]
@@ -17,6 +17,14 @@ zip = { version = "2.4", default-features = false, features = ["deflate"] }
 dirs = "6"
 chrono = { version = "0.4", features = ["clock"] }
 image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
+
+[features]
+default = []
+# Keep the Windows console subsystem for development/debugging.
+console = []
+
+[build-dependencies]
+embed-resource = "3.0"
 
 [profile.dev]
 opt-level = 0

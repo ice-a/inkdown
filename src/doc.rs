@@ -1,6 +1,7 @@
 //! The document model, plus the small markdown utilities the UI needs:
 //! an outline, writing statistics and a self-contained HTML export.
 
+use std::ops::Range;
 use std::path::PathBuf;
 
 use gpui_kit::SharedString;
@@ -188,6 +189,130 @@ fn fence_start(trimmed: &str) -> Option<(char, usize)> {
     (len >= 3).then_some((marker, len))
 }
 
+/// Languages the code-block language picker offers, as the token written
+/// into the fence paired with its display name. Every token resolves in the
+/// grammar set the preview highlights with (syntect's syntaxes plus bat's
+/// extras), so picking one turns syntax highlighting on.
+pub const CODE_LANGUAGES: &[(&str, &str)] = &[
+    ("ada", "Ada"),
+    ("asm", "Assembly"),
+    ("awk", "AWK"),
+    ("bash", "Bash / Shell"),
+    ("c", "C"),
+    ("cmd", "Batch / CMD"),
+    ("cmake", "CMake"),
+    ("cpp", "C++"),
+    ("csharp", "C#"),
+    ("css", "CSS"),
+    ("csv", "CSV"),
+    ("dart", "Dart"),
+    ("diff", "Diff"),
+    ("dockerfile", "Dockerfile"),
+    ("elixir", "Elixir"),
+    ("erb", "ERB"),
+    ("erlang", "Erlang"),
+    ("f#", "F#"),
+    ("fish", "Fish"),
+    ("go", "Go"),
+    ("gradle", "Gradle"),
+    ("graphql", "GraphQL"),
+    ("groovy", "Groovy"),
+    ("haskell", "Haskell"),
+    ("html", "HTML"),
+    ("ini", "INI"),
+    ("java", "Java"),
+    ("javascript", "JavaScript"),
+    ("jinja", "Jinja"),
+    ("json", "JSON"),
+    ("julia", "Julia"),
+    ("kotlin", "Kotlin"),
+    ("latex", "LaTeX"),
+    ("less", "Less"),
+    ("lisp", "Lisp"),
+    ("lua", "Lua"),
+    ("makefile", "Makefile"),
+    ("markdown", "Markdown"),
+    ("matlab", "MATLAB"),
+    ("nim", "Nim"),
+    ("nix", "Nix"),
+    ("objective-c", "Objective-C"),
+    ("ocaml", "OCaml"),
+    ("perl", "Perl"),
+    ("php", "PHP"),
+    ("proto", "Protocol Buffers"),
+    ("python", "Python"),
+    ("r", "R"),
+    ("ruby", "Ruby"),
+    ("rust", "Rust"),
+    ("sass", "Sass"),
+    ("scala", "Scala"),
+    ("scss", "SCSS"),
+    ("svelte", "Svelte"),
+    ("swift", "Swift"),
+    ("tcl", "Tcl"),
+    ("terraform", "Terraform"),
+    ("toml", "TOML"),
+    ("ts", "TypeScript"),
+    ("tsx", "TSX / React"),
+    ("twig", "Twig"),
+    ("vim", "Vim script"),
+    ("vue", "Vue"),
+    ("xml", "XML"),
+    ("yaml", "YAML"),
+    ("zig", "Zig"),
+    ("zsh", "Zsh"),
+];
+
+/// The picker's display name for a fence language token, when it knows it.
+pub fn code_language_display(token: &str) -> Option<&'static str> {
+    CODE_LANGUAGES
+        .iter()
+        .find(|(known, _)| *known == token)
+        .map(|(_, display)| *display)
+}
+
+/// The byte range of the language word on the opening fence line of the code
+/// block starting at `block_start`, or `None` when that offset does not sit
+/// on a fence. An empty range means the fence carries no language yet, so
+/// inserting at it adds one.
+///
+/// The range covers only the first word; a fence meta suffix such as
+/// ` ```rust ignore ` keeps its rest untouched.
+pub fn fence_lang_range(source: &str, block_start: usize) -> Option<Range<usize>> {
+    if block_start > source.len() {
+        return None;
+    }
+    // The span can start at the fence itself rather than at the line start,
+    // so anchor on the line that contains it.
+    let line_start = source[..block_start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = source[line_start..]
+        .find('\n')
+        .map_or(source.len(), |i| line_start + i);
+    let line = &source[line_start..line_end];
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let info_start = line_start + indent;
+    let info = &source[info_start..line_end];
+    let marker = info.as_bytes().first().copied()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let fence_len = info.len() - info.trim_start_matches(marker as char).len();
+    if fence_len < 3 {
+        return None;
+    }
+    let rest = &info[fence_len..];
+    let word = rest.trim_start_matches([' ', '\t']);
+    if word.is_empty() {
+        return Some((info_start + fence_len)..(info_start + info.len()));
+    }
+    let lead = rest.len() - word.len();
+    let word_len = word.find(char::is_whitespace).unwrap_or(word.len());
+    Some((info_start + fence_len + lead)..(info_start + fence_len + lead + word_len))
+}
+
 fn parse_heading(trimmed: &str) -> Option<(usize, String)> {
     let level = trimmed.chars().take_while(|c| *c == '#').count();
     if !(1..=6).contains(&level) {
@@ -353,6 +478,189 @@ pub fn export_html(title: &str, source: &str) -> String {
 </html>
 "#
     )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DocumentTemplate {
+    /// Short label in the template picker.
+    pub name: &'static str,
+    pub description: &'static str,
+    /// Suggested file name without the extension.
+    pub file_stem: &'static str,
+    pub content: &'static str,
+}
+
+/// A small, opinionated set of starting points. They are plain Markdown with
+/// a frontmatter block, so every existing feature (metadata panel, outline,
+/// stats, publish) works on them unchanged.
+pub const TEMPLATES: &[DocumentTemplate] = &[
+    DocumentTemplate {
+        name: "普通文章",
+        description: "标题、摘要、正文与总结，适合公众号或博客",
+        file_stem: "新文章",
+        content: r#"---
+title: 未命名文章
+author:
+tags:
+---
+
+# 未命名文章
+
+> 用一句话说清楚这篇文章要讲什么。
+
+## 背景
+
+为什么写这件事？读者现在处在什么情境里？
+
+## 正文
+
+### 第一个要点
+
+展开你的观点，给一个具体的例子或数据。
+
+### 第二个要点
+
+补充论据，或者换一个角度看同一个问题。
+
+## 总结
+
+回到开头的问题，给读者一个可以带走的结论。
+
+- 要点一
+- 要点二
+- 要点三
+"#,
+    },
+    DocumentTemplate {
+        name: "技术笔记",
+        description: "问题、结论、过程与参考，适合记录一次排查",
+        file_stem: "技术笔记",
+        content: r#"---
+title: 技术笔记
+tags:
+created:
+---
+
+# 技术笔记
+
+## 结论先行
+
+一句话说明问题是怎么解决的。
+
+## 问题
+
+- 现象：
+- 影响范围：
+- 复现步骤：
+
+## 排查过程
+
+```text
+在这里贴关键日志或命令
+```
+
+1. 第一步观察到了什么
+2. 第二步排除了什么
+3. 最后定位到哪里
+
+## 方案
+
+说明改动、取舍和风险。
+
+## 参考
+
+- [链接标题](https://example.com)
+"#,
+    },
+    DocumentTemplate {
+        name: "周报",
+        description: "本周进展、风险与下周计划",
+        file_stem: "周报",
+        content: r#"---
+title: 本周周报
+week:
+author:
+tags: 周报
+---
+
+# 本周周报
+
+## 本周进展
+
+- [x] 完成事项一
+- [x] 完成事项二
+- [ ] 顺延事项
+
+## 关键结果
+
+| 事项 | 状态 | 说明 |
+| --- | --- | --- |
+| 事项一 | 已完成 | 结果或数据 |
+| 事项二 | 进行中 | 当前进度 |
+
+## 风险与阻塞
+
+- 风险：
+- 需要谁支持：
+
+## 下周计划
+
+1. 填写下周第一件事
+2. 填写下周第二件事
+3. 填写下周第三件事
+"#,
+    },
+    DocumentTemplate {
+        name: "会议纪要",
+        description: "议题、结论与待办，会后直接发出去",
+        file_stem: "会议纪要",
+        content: r#"---
+title: 会议纪要
+date:
+attendees:
+tags: 会议
+---
+
+# 会议纪要
+
+- **时间**：
+- **参会人**：
+- **主持人**：
+- **记录人**：
+
+## 议题
+
+1. 议题一
+2. 议题二
+
+## 讨论要点
+
+- 记录讨论中的关键判断
+
+## 结论
+
+- 结论一
+
+## 待办
+
+- [ ] 事项 — 负责人 — 截止时间
+- [ ] 事项 — 负责人 — 截止时间
+"#,
+    },
+];
+
+impl DocumentTemplate {
+    pub fn document(&self, id: u64) -> Document {
+        Document {
+            id,
+            title: format!("{}.md", self.file_stem).into(),
+            path: None,
+            content: self.content.to_string(),
+            // Templates start unsaved, so the title bar shows the dirty hint
+            // until the user picks a real file.
+            saved_content: String::new(),
+        }
+    }
 }
 
 pub fn sample_documents() -> Vec<Document> {
@@ -557,7 +865,6 @@ mod tests {
         assert_eq!(stats(source).lines, source.lines().count());
     }
 
-
     #[test]
     fn edits_frontmatter_fields() {
         let source = "---\ntitle: 逆向\nauthor: \n---\n# 正文\n";
@@ -583,5 +890,67 @@ mod tests {
         assert_eq!(split_frontmatter(source), (None, source));
         let plain = "# 标题";
         assert_eq!(split_frontmatter(plain), (None, plain));
+    }
+
+    #[test]
+    fn templates_are_publishable_documents() {
+        assert!(TEMPLATES.len() >= 4);
+        for template in TEMPLATES {
+            assert!(!template.name.is_empty());
+            assert!(!template.file_stem.is_empty());
+            assert!(!template.content.trim().is_empty());
+            assert!(template.content.lines().any(|line| line.starts_with("# ")));
+            assert!(!frontmatter_fields(template.content).is_empty());
+            let document = template.document(1);
+            assert!(document.is_dirty());
+            assert!(document.title.ends_with(".md"));
+            assert!(split_frontmatter(&document.content).0.is_some());
+        }
+    }
+
+    #[test]
+    fn finds_language_word_on_fence_lines() {
+        let source = "# t\n\n```rust\nfn main() {}\n```\n";
+        let fence = source.find("```rust").unwrap();
+        assert_eq!(fence_lang_range(source, fence), Some(8..12));
+
+        // The span may point a few bytes into the fence line itself.
+        assert_eq!(fence_lang_range(source, fence + 3), Some(8..12));
+        // A line that is not a fence yields nothing.
+        assert_eq!(
+            fence_lang_range(source, source.find("fn main").unwrap()),
+            None
+        );
+
+        // No language: an empty range right after the fence marks the spot.
+        let bare = "``` \n\ncode\n```";
+        assert_eq!(fence_lang_range(bare, 0), Some(3..4));
+
+        // Meta after the language is left alone; the word itself is replaced.
+        let meta = "```js title=demo\ncode\n```";
+        assert_eq!(fence_lang_range(meta, 0), Some(3..5));
+
+        // Four backtick fences, tilde fences and indented fences all work.
+        let long = "````python\nx\n````";
+        assert_eq!(fence_lang_range(long, 0), Some(4..10));
+        let tilde = "~~~go\nx\n~~~";
+        assert_eq!(fence_lang_range(tilde, 0), Some(3..5));
+        let indented = "   ```ts\nx\n```";
+        assert_eq!(fence_lang_range(indented, 3), Some(6..8));
+
+        // Not a fence, too deep an indent, past the end: no range.
+        assert_eq!(fence_lang_range("# heading", 0), None);
+        assert_eq!(fence_lang_range("    ```rust\nx", 4), None);
+        assert_eq!(fence_lang_range("```", 99), None);
+    }
+
+    #[test]
+    fn code_language_picker_tokens_all_have_display_names() {
+        for (token, display) in CODE_LANGUAGES {
+            assert!(!token.is_empty());
+            assert!(!display.is_empty());
+            assert_eq!(code_language_display(token), Some(*display));
+        }
+        assert_eq!(code_language_display("no-such-language"), None);
     }
 }

@@ -26,9 +26,9 @@ pub fn version() -> Result<String, String> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let output = command.output().map_err(|error| {
-        format!("找不到 git，请先安装 Git for Windows（{error}）")
-    })?;
+    let output = command
+        .output()
+        .map_err(|error| format!("找不到 git，请先安装 Git for Windows（{error}）"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -109,7 +109,10 @@ pub fn status(root: &Path) -> Result<String, String> {
     let branch = run(root, &["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_else(|_| "（还没有提交）".to_string());
     let porcelain = run(root, &["status", "--porcelain"])?;
-    let changes = porcelain.lines().filter(|line| !line.trim().is_empty()).count();
+    let changes = porcelain
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
     Ok(if changes == 0 {
         format!("{branch} · 工作区干净")
     } else {
@@ -150,8 +153,8 @@ pub fn sync(root: &Path, config: &GitConfig) -> Result<String, String> {
         run(root, &["checkout", "-B", branch])?;
     }
 
-    let has_remote = !config.remote.trim().is_empty()
-        || run(root, &["remote", "get-url", "origin"]).is_ok();
+    let has_remote =
+        !config.remote.trim().is_empty() || run(root, &["remote", "get-url", "origin"]).is_ok();
     if has_remote {
         match run(root, &["pull", "--rebase", "origin", branch]) {
             Ok(_) => log.push("已拉取远端更新".to_string()),
@@ -166,7 +169,6 @@ pub fn sync(root: &Path, config: &GitConfig) -> Result<String, String> {
     Ok(log.join("\n"))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,7 +180,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "inkdown-git-test-{name}-{}-{}",
             std::process::id(),
-            chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
         ));
         fs::create_dir_all(&path).unwrap();
         path
@@ -208,7 +212,13 @@ mod tests {
         assert!(log.contains("已推送") || log.contains("已提交"), "{log}");
 
         let output = Command::new("git")
-            .args(["--git-dir", remote.to_str().unwrap(), "rev-list", "--count", "main"])
+            .args([
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "rev-list",
+                "--count",
+                "main",
+            ])
             .output()
             .unwrap();
         assert!(output.status.success());

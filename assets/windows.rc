@@ -1,0 +1,3 @@
+// Resource ID 1 is what GPUI's Windows backend asks for when it sets the
+// window class icon; Explorer and the taskbar also read this icon.
+1 ICON "assets/icon/inkdown.ico"

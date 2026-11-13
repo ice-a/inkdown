@@ -14,9 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use pulldown_cmark::{
-    Alignment, Event, Options, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use serde_json::{Value, json};
 
 use crate::config::{CnblogsConfig, ImageHostConfig, ImageHostKind, WechatConfig};
@@ -257,11 +255,7 @@ pub struct UploadResult {
 }
 
 /// Upload every local image referenced by the Markdown and rewrite the source.
-pub fn upload_local_images(
-    markdown: &str,
-    doc_dir: &Path,
-    host: &ImageHostConfig,
-) -> UploadResult {
+pub fn upload_local_images(markdown: &str, doc_dir: &Path, host: &ImageHostConfig) -> UploadResult {
     let mut result = UploadResult {
         markdown: markdown.to_string(),
         uploaded: 0,
@@ -303,7 +297,8 @@ pub fn upload_local_images(
 // ---------------------------------------------------------------------------
 // HTML conversion
 
-const P: &str = "margin:0 0 20px;font-size:16px;line-height:1.85;color:#3f3f3f;letter-spacing:0.5px;";
+const P: &str =
+    "margin:0 0 20px;font-size:16px;line-height:1.85;color:#3f3f3f;letter-spacing:0.5px;";
 const P_IN_LIST: &str = "margin:0 0 6px;font-size:16px;line-height:1.8;color:#3f3f3f;";
 const LINK: &str = "color:#576b95;text-decoration:none;";
 const INLINE_CODE: &str = "padding:2px 6px;border-radius:4px;background:#f2f3f5;color:#c7254e;font-family:Consolas,'Courier New',monospace;font-size:14px;";
@@ -697,10 +692,7 @@ fn wechat_upload(token: &str, bytes: &[u8], name: &str, permanent: bool) -> Resu
             "media_id",
         )
     } else {
-        (
-            "https://api.weixin.qq.com/cgi-bin/media/uploadimg",
-            "url",
-        )
+        ("https://api.weixin.qq.com/cgi-bin/media/uploadimg", "url")
     };
     let mut request = imagebed::agent()
         .post(url)
@@ -790,21 +782,18 @@ pub fn wechat_publish(
         }
     }
 
-    let cover_source = image_sources(markdown)
-        .into_iter()
-        .next()
-        .or_else(|| {
-            let path = config.default_cover.trim();
-            (!path.is_empty()).then(|| path.to_string())
-        });
+    let cover_source = image_sources(markdown).into_iter().next().or_else(|| {
+        let path = config.default_cover.trim();
+        (!path.is_empty()).then(|| path.to_string())
+    });
     let Some(cover_source) = cover_source else {
         return Err(
             "公众号草稿需要封面图。请在文章里插入一张图片，或在设置里填写默认封面路径。"
                 .to_string(),
         );
     };
-    let (cover_bytes, cover_name) = load_image(&cover_source, doc_dir)
-        .map_err(|error| format!("封面图读取失败：{error}"))?;
+    let (cover_bytes, cover_name) =
+        load_image(&cover_source, doc_dir).map_err(|error| format!("封面图读取失败：{error}"))?;
     let thumb_media_id = wechat_upload(&token, &cover_bytes, &cover_name, true)?;
 
     let content = render_inline_html(markdown, &image_map, config.footnote_links);
@@ -828,7 +817,11 @@ pub fn wechat_publish(
         .post("https://api.weixin.qq.com/cgi-bin/draft/add")
         .query("access_token", &token)
         .set("Content-Type", "application/json; charset=utf-8")
-        .send_bytes(serde_json::to_string(&payload).unwrap_or_default().as_bytes());
+        .send_bytes(
+            serde_json::to_string(&payload)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
     let value = wechat_json(response)?;
     check_wechat(&value)?;
     let media_id = value
@@ -837,10 +830,7 @@ pub fn wechat_publish(
         .ok_or_else(|| format!("微信没有返回草稿 media_id：{value}"))?
         .to_string();
 
-    Ok(WechatOutcome {
-        media_id,
-        warnings,
-    })
+    Ok(WechatOutcome { media_id, warnings })
 }
 
 // ---------------------------------------------------------------------------
@@ -855,11 +845,7 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-pub fn cnblogs_publish(
-    config: &CnblogsConfig,
-    title: &str,
-    html: &str,
-) -> Result<String, String> {
+pub fn cnblogs_publish(config: &CnblogsConfig, title: &str, html: &str) -> Result<String, String> {
     if config.username.trim().is_empty() || config.token.trim().is_empty() {
         return Err("还没有填写博客园用户名 / MetaWeblog 令牌".to_string());
     }
@@ -978,7 +964,9 @@ pub fn publish(request: PublishRequest) -> PublishOutcome {
         if result.markdown != source {
             source = result.markdown;
             updated = true;
-            log.push(format!("已上传 {uploaded_images} 张图片到图床并更新 Markdown"));
+            log.push(format!(
+                "已上传 {uploaded_images} 张图片到图床并更新 Markdown"
+            ));
         }
     }
 
@@ -986,8 +974,7 @@ pub fn publish(request: PublishRequest) -> PublishOutcome {
     let (_, body) = split_frontmatter(&source);
     let generic_html = render_inline_html(body, &HashMap::new(), false);
     let wechat_manual = request.targets.wechat
-        && (request.wechat.app_id.trim().is_empty()
-            || request.wechat.app_secret.trim().is_empty());
+        && (request.wechat.app_id.trim().is_empty() || request.wechat.app_secret.trim().is_empty());
     let clipboard_html = if wechat_manual {
         Some(render_inline_html(
             body,
@@ -1049,13 +1036,13 @@ pub fn publish(request: PublishRequest) -> PublishOutcome {
         log,
         warnings,
         updated_markdown: updated.then_some(source.clone()),
-        clipboard_html: needs_clipboard.then_some(clipboard_html.unwrap_or_else(|| generic_html.clone())),
+        clipboard_html: needs_clipboard
+            .then_some(clipboard_html.unwrap_or_else(|| generic_html.clone())),
         plain_text: source,
         open_urls,
         uploaded_images,
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1066,10 +1053,7 @@ mod tests {
         let source = "![a](images/a.png)\n<img src=\"images/b.png\" />\n![b](images/a.png)";
         assert_eq!(
             image_sources(source),
-            vec![
-                "images/a.png".to_string(),
-                "images/b.png".to_string()
-            ]
+            vec!["images/a.png".to_string(), "images/b.png".to_string()]
         );
     }
 
@@ -1094,7 +1078,6 @@ mod tests {
         assert!(html.contains("https://example.com"));
     }
 
-
     #[test]
     fn publish_html_ignores_frontmatter() {
         let mut targets = Targets::default();
@@ -1116,7 +1099,8 @@ mod tests {
 
     #[test]
     fn excerpt_ignores_markdown_noise() {
-        let text = "# 标题\n\n这是 **正文**，带一个[链接](https://example.com)和图片 ![alt](x.png)。";
+        let text =
+            "# 标题\n\n这是 **正文**，带一个[链接](https://example.com)和图片 ![alt](x.png)。";
         let excerpt = excerpt(text, 40);
         assert!(excerpt.contains("正文"));
         assert!(!excerpt.contains("**"));

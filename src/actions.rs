@@ -8,6 +8,7 @@ actions!(
     inkdown,
     [
         NewDocument,
+        NewFromTemplate,
         OpenDocument,
         OpenFolder,
         RefreshFolder,

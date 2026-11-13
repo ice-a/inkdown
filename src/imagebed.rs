@@ -53,7 +53,12 @@ fn boundary() -> String {
     format!("----Inkdown{:x}{:x}", std::process::id(), nanos)
 }
 
-pub(crate) fn multipart(field: &str, file_name: &str, mime: &str, bytes: &[u8]) -> (String, Vec<u8>) {
+pub(crate) fn multipart(
+    field: &str,
+    file_name: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> (String, Vec<u8>) {
     let boundary = boundary();
     let mut body = Vec::with_capacity(bytes.len() + 512);
     body.extend_from_slice(
@@ -124,10 +129,7 @@ pub fn upload_bytes(
                 .set("Content-Type", &content_type)
                 .set("Accept", "application/json");
             if !config.token.trim().is_empty() {
-                request = request.set(
-                    "Authorization",
-                    &format!("Bearer {}", config.token.trim()),
-                );
+                request = request.set("Authorization", &format!("Bearer {}", config.token.trim()));
             }
             send(request, &body)?
         }
@@ -139,10 +141,7 @@ pub fn upload_bytes(
                 .set("Content-Type", &content_type)
                 .set("Accept", "application/json");
             if !config.token.trim().is_empty() {
-                request = request.set(
-                    "Authorization",
-                    &format!("Bearer {}", config.token.trim()),
-                );
+                request = request.set("Authorization", &format!("Bearer {}", config.token.trim()));
             }
             send(request, &body)?
         }
@@ -240,7 +239,6 @@ pub fn download(url: &str, limit: usize) -> Result<(Vec<u8>, String), String> {
     }
     Ok((bytes, mime))
 }
-
 
 #[cfg(test)]
 mod tests {

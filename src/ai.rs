@@ -159,12 +159,80 @@ pub fn generate(config: &AiConfig, topic: &str, context: &str) -> Result<String,
         );
     let value = error_body(response)?;
 
-    content_of(&value).filter(|text| !text.trim().is_empty()).ok_or_else(|| {
-        format!(
-            "AI 服务没有返回正文（choices[0].message.content 为空）：{}",
-            &value.to_string().chars().take(300).collect::<String>()
+    content_of(&value)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "AI 服务没有返回正文（choices[0].message.content 为空）：{}",
+                &value.to_string().chars().take(300).collect::<String>()
+            )
+        })
+}
+
+/// One turn of a chat conversation, in the OpenAI `messages` shape.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// The system message for the `/询问 AI` conversation window. The article
+/// prompt from the settings is for generating whole documents, so the chat
+/// keeps its own short one.
+pub const CHAT_SYSTEM_PROMPT: &str = "你是 Inkdown 的写作助手，和作者一起打磨文稿。回答简洁、具体、不寒暄：解释写作或 Markdown 问题时直接给要点，改写或续写文字时直接给结果，涉及代码时用 ``` 围栏并标注语言。";
+
+/// POST {base}/chat/completions for a whole conversation.
+///
+/// `turns` holds the past user and assistant messages in order, the last one
+/// being the new user message; an empty `system` sends no system message.
+pub fn chat(config: &AiConfig, system: &str, turns: &[ChatTurn]) -> Result<String, String> {
+    let base = base(config)?;
+    if config.api_key.trim().is_empty() {
+        return Err("还没有填写 API Key".to_string());
+    }
+    if config.model.trim().is_empty() {
+        return Err("还没有选择模型".to_string());
+    }
+    if turns.is_empty() {
+        return Err("还没有要发送的消息".to_string());
+    }
+
+    let mut messages = Vec::with_capacity(turns.len() + 1);
+    if !system.trim().is_empty() {
+        messages.push(json!({ "role": "system", "content": system.trim() }));
+    }
+    for turn in turns {
+        messages.push(json!({ "role": turn.role, "content": turn.content }));
+    }
+
+    let payload = json!({
+        "model": config.model.trim(),
+        "messages": messages,
+        "stream": false
+    });
+
+    let response = agent()
+        .post(&format!("{base}/chat/completions"))
+        .set(
+            "Authorization",
+            &format!("Bearer {}", config.api_key.trim()),
         )
-    })
+        .set("Content-Type", "application/json")
+        .send_bytes(
+            serde_json::to_string(&payload)
+                .map_err(|error| error.to_string())?
+                .as_bytes(),
+        );
+    let value = error_body(response)?;
+
+    content_of(&value)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "AI 服务没有返回回复（choices[0].message.content 为空）：{}",
+                &value.to_string().chars().take(300).collect::<String>()
+            )
+        })
 }
 
 /// Strip a leading ```` ```markdown ```` fence some models wrap output in.
@@ -244,7 +312,11 @@ mod tests {
                 String::from_utf8_lossy(&body).to_string(),
             ));
         }
-        (requests[0].0.clone(), requests[0].1.clone(), requests[1].2.clone())
+        (
+            requests[0].0.clone(),
+            requests[0].1.clone(),
+            requests[1].2.clone(),
+        )
     }
 
     #[test]
@@ -283,5 +355,74 @@ mod tests {
         );
         assert_eq!(clean_markdown("# 直接输出"), "# 直接输出");
         assert_eq!(clean_markdown("```\ncode\n```"), "code");
+    }
+
+    #[test]
+    fn chats_with_full_history() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Content-Length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = reader.into_inner();
+            let response = r##"{"choices":[{"message":{"content":"好的，这样就简洁了。"}}]}"##;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        });
+
+        let config = AiConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key: "sk-test".to_string(),
+            model: "ink-chat".to_string(),
+            prompt: String::new(),
+        };
+        let turns = vec![
+            ChatTurn {
+                role: "user".to_string(),
+                content: "第一问".to_string(),
+            },
+            ChatTurn {
+                role: "assistant".to_string(),
+                content: "第一答".to_string(),
+            },
+            ChatTurn {
+                role: "user".to_string(),
+                content: "第二问".to_string(),
+            },
+        ];
+
+        let reply = chat(&config, CHAT_SYSTEM_PROMPT, &turns).unwrap();
+        assert_eq!(reply, "好的，这样就简洁了。");
+
+        let body = server.join().unwrap();
+        assert!(body.contains("\"model\":\"ink-chat\""));
+        assert!(body.contains("Inkdown 的写作助手"));
+        // The whole history goes out, in order, as chat messages.
+        let first_user = body.find("第一问").unwrap();
+        let first_assistant = body.find("第一答").unwrap();
+        let second_user = body.find("第二问").unwrap();
+        assert!(body.contains("\"role\":\"system\""));
+        assert!(body.contains("\"role\":\"assistant\""));
+        assert!(first_user < first_assistant && first_assistant < second_user);
     }
 }

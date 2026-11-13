@@ -73,30 +73,90 @@ impl SettingsForm {
                 .soft_wrap(true)
         });
         Self {
-            ai_base: input(window, cx, "https://api.openai.com/v1", false, &config.ai.base_url),
+            ai_base: input(
+                window,
+                cx,
+                "https://api.openai.com/v1",
+                false,
+                &config.ai.base_url,
+            ),
             ai_key: input(window, cx, "sk-…", true, &config.ai.api_key),
-            ai_model: input(window, cx, "先拉取模型或手动填写模型名", false, &config.ai.model),
+            ai_model: input(
+                window,
+                cx,
+                "先拉取模型或手动填写模型名",
+                false,
+                &config.ai.model,
+            ),
             ai_prompt,
             ai_models: Vec::new(),
             image_kind: config.image_host.kind,
-            image_url: input(window, cx, "https://img.example.com", false, &config.image_host.base_url),
-            image_auth: input(window, cx, "图床 authCode（可选）", false, &config.image_host.auth_code),
-            image_token: input(window, cx, "API Token（可选）", true, &config.image_host.token),
+            image_url: input(
+                window,
+                cx,
+                "https://img.example.com",
+                false,
+                &config.image_host.base_url,
+            ),
+            image_auth: input(
+                window,
+                cx,
+                "图床 authCode（可选）",
+                false,
+                &config.image_host.auth_code,
+            ),
+            image_token: input(
+                window,
+                cx,
+                "API Token（可选）",
+                true,
+                &config.image_host.token,
+            ),
             image_upload_on_paste: config.image_host.upload_on_paste,
             wx_appid: input(window, cx, "公众号 AppID", false, &config.wechat.app_id),
             wx_secret: input(window, cx, "AppSecret", true, &config.wechat.app_secret),
             wx_author: input(window, cx, "作者名", false, &config.wechat.author),
-            wx_cover: input(window, cx, "默认封面图绝对路径（可选）", false, &config.wechat.default_cover),
+            wx_cover: input(
+                window,
+                cx,
+                "默认封面图绝对路径（可选）",
+                false,
+                &config.wechat.default_cover,
+            ),
             wechat_footnote: config.wechat.footnote_links,
             cn_user: input(window, cx, "博客园用户名", false, &config.cnblogs.username),
-            cn_token: input(window, cx, "MetaWeblog 访问令牌", true, &config.cnblogs.token),
-            cn_blogid: input(window, cx, "Blog ID（留空使用用户名）", false, &config.cnblogs.blog_id),
-            git_remote: input(window, cx, "https://github.com/you/repo.git", false, &config.git.remote),
+            cn_token: input(
+                window,
+                cx,
+                "MetaWeblog 访问令牌",
+                true,
+                &config.cnblogs.token,
+            ),
+            cn_blogid: input(
+                window,
+                cx,
+                "Blog ID（留空使用用户名）",
+                false,
+                &config.cnblogs.blog_id,
+            ),
+            git_remote: input(
+                window,
+                cx,
+                "https://github.com/you/repo.git",
+                false,
+                &config.git.remote,
+            ),
             git_branch: input(window, cx, "main", false, &config.git.branch),
             git_name: input(window, cx, "Git 用户名", false, &config.git.user_name),
             git_email: input(window, cx, "Git 邮箱", false, &config.git.user_email),
             git_auto_sync: config.git.auto_sync,
-            backup_dir: input(window, cx, "留空使用默认备份目录", false, &config.backup.directory),
+            backup_dir: input(
+                window,
+                cx,
+                "留空使用默认备份目录",
+                false,
+                &config.backup.directory,
+            ),
             auto_backup: config.backup.auto_backup,
             notice: None,
             busy: None,
@@ -209,17 +269,12 @@ pub struct PublishForm {
 }
 
 impl PublishForm {
-    pub fn new(
-        window: &mut Window,
-        cx: &mut App,
-        title: &str,
-        config: &AppConfig,
-    ) -> Self {
+    pub fn new(window: &mut Window, cx: &mut App, title: &str, config: &AppConfig) -> Self {
         let mut targets = Targets::default();
-        targets.wechat = !config.wechat.app_id.trim().is_empty()
-            && !config.wechat.app_secret.trim().is_empty();
-        targets.cnblogs = !config.cnblogs.username.trim().is_empty()
-            && !config.cnblogs.token.trim().is_empty();
+        targets.wechat =
+            !config.wechat.app_id.trim().is_empty() && !config.wechat.app_secret.trim().is_empty();
+        targets.cnblogs =
+            !config.cnblogs.username.trim().is_empty() && !config.cnblogs.token.trim().is_empty();
         Self {
             title: input(window, cx, "文章标题", false, title),
             targets,
@@ -230,8 +285,9 @@ impl PublishForm {
     }
 
     pub fn reset(&mut self, title: &str, window: &mut Window, cx: &mut App) {
-        self.title
-            .update(cx, |state, cx| state.set_value(title.to_string(), window, cx));
+        self.title.update(cx, |state, cx| {
+            state.set_value(title.to_string(), window, cx)
+        });
         self.status.clear();
         self.busy = false;
     }
@@ -268,7 +324,6 @@ pub fn prompt_title(kind: &PromptKind) -> (&'static str, &'static str, bool) {
         PromptKind::Delete(_) => ("确认删除", "删除后无法恢复，确定继续吗？", false),
     }
 }
-
 
 pub struct AiForm {
     pub topic: Entity<InputState>,

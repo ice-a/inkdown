@@ -41,7 +41,8 @@ pub fn backup_workspace(root: &Path, backup_dir: &Path) -> Result<PathBuf, Strin
 
     let mut count = 0;
     add_dir(&mut zip, root, root, options, &mut count)?;
-    zip.finish().map_err(|error| format!("写入备份失败：{error}"))?;
+    zip.finish()
+        .map_err(|error| format!("写入备份失败：{error}"))?;
     Ok(path)
 }
 
@@ -58,11 +59,7 @@ pub fn backup_documents(
     for (index, (name, content)) in documents.iter().enumerate() {
         let mut name = sanitize(name);
         if !used.insert(name.clone()) {
-            name = format!(
-                "{}-{}.md",
-                name.trim_end_matches(".md"),
-                index + 1
-            );
+            name = format!("{}-{}.md", name.trim_end_matches(".md"), index + 1);
             used.insert(name.clone());
         }
         zip.start_file(name, options)
@@ -70,7 +67,8 @@ pub fn backup_documents(
         zip.write_all(content.as_bytes())
             .map_err(|error| format!("写入备份失败：{error}"))?;
     }
-    zip.finish().map_err(|error| format!("写入备份失败：{error}"))?;
+    zip.finish()
+        .map_err(|error| format!("写入备份失败：{error}"))?;
     Ok(path)
 }
 
@@ -128,7 +126,6 @@ fn sanitize(name: &str) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,7 +136,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "inkdown-backup-test-{}-{}",
             std::process::id(),
-            chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
         ));
         let out = root.join("out");
         std::fs::create_dir_all(root.join("sub")).unwrap();

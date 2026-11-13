@@ -1,29 +1,26 @@
 //! Tiny shared presentation helpers.
 
-use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
+use std::sync::{Arc, OnceLock};
+
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 
-/// The seal-red mark in the title bar.
-pub fn logo() -> impl IntoElement {
-    let warm = Hsla::from(rgb(0xB4552D));
-    let light = Hsla::from(rgb(0xD98E5F));
-    div()
-        .size(px(20.))
-        .rounded(px(6.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(linear_gradient(
-            140.,
-            linear_color_stop(warm, 0.),
-            linear_color_stop(light, 1.),
+fn logo_image() -> Arc<Image> {
+    static LOGO: OnceLock<Arc<Image>> = OnceLock::new();
+    LOGO.get_or_init(|| {
+        Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../assets/icon/inkdown-64.png").to_vec(),
         ))
-        .child(
-            Icon::new(IconName::Feather)
-                .with_size(px(12.))
-                .text_color(Hsla::from(rgb(0xFFF7EF))),
-        )
+    })
+    .clone()
+}
+
+/// The Inkdown mark in the title bar.
+pub fn logo() -> impl IntoElement {
+    img(ImageSource::from(logo_image()))
+        .size(px(20.))
+        .rounded(px(5.))
 }
 
 /// A one-pixel vertical rule for toolbars and title bars.
