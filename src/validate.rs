@@ -792,7 +792,10 @@ fn probe_hardware() -> Hardware {
     Hardware::default()
 }
 
-/// Parse the fixed `KEY:value` lines [`probe_hardware`] prints.
+/// Parse the fixed `KEY:value` lines [`probe_hardware`] prints. Only the
+/// Windows probe (and its unit test) ever feeds this — keep it out of
+/// non-Windows release builds so deny-warnings CI stays green.
+#[cfg(any(windows, test))]
 pub fn parse_hardware(stdout: &str) -> Hardware {
     let mut hardware = Hardware::default();
     for line in stdout.lines() {
