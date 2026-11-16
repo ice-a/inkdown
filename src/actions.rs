@@ -42,9 +42,11 @@ actions!(
         FormatDivider,
         PublishArticle,
         AiWrite,
+        AiFormat,
         OpenSettings,
         CreateBackup,
         GitSync,
+        OpenHistory,
         RevealInFiles,
         CloseOverlay,
     ]

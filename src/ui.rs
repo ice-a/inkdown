@@ -6,7 +6,8 @@ use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::*;
 
 use crate::config::{
-    AiConfig, AppConfig, CnblogsConfig, GitConfig, ImageHostConfig, ImageHostKind, WechatConfig,
+    AiConfig, AppConfig, CnblogsConfig, GitConfig, ImageHostConfig, ImageHostKind, StartupMode,
+    WechatConfig,
 };
 use crate::publish::Targets;
 
@@ -59,6 +60,13 @@ pub struct SettingsForm {
 
     pub backup_dir: Entity<InputState>,
     pub auto_backup: bool,
+
+    pub startup_mode: StartupMode,
+    pub startup_document: Entity<InputState>,
+
+    pub history_enabled: bool,
+    /// Minutes between history snapshots, as text so the field watches edits.
+    pub history_interval: Entity<InputState>,
 
     pub notice: Option<String>,
     pub busy: Option<String>,
@@ -158,6 +166,22 @@ impl SettingsForm {
                 &config.backup.directory,
             ),
             auto_backup: config.backup.auto_backup,
+            startup_mode: config.startup_mode,
+            startup_document: input(
+                window,
+                cx,
+                "启动时打开的 Markdown 文件绝对路径",
+                false,
+                config.startup_document.as_deref().unwrap_or(""),
+            ),
+            history_enabled: config.history.enabled,
+            history_interval: input(
+                window,
+                cx,
+                "5",
+                false,
+                &config.history.interval_minutes.to_string(),
+            ),
             notice: None,
             busy: None,
         }
@@ -184,6 +208,8 @@ impl SettingsForm {
             self.git_name.clone(),
             self.git_email.clone(),
             self.backup_dir.clone(),
+            self.startup_document.clone(),
+            self.history_interval.clone(),
         ]
     }
 
@@ -195,6 +221,22 @@ impl SettingsForm {
         config.git = self.git(cx);
         config.backup.directory = self.backup_dir.read(cx).value().to_string();
         config.backup.auto_backup = self.auto_backup;
+        config.startup_mode = self.startup_mode;
+        let startup_document = self.startup_document.read(cx).value().trim().to_string();
+        config.startup_document = if startup_document.is_empty() {
+            None
+        } else {
+            Some(startup_document)
+        };
+        config.history.enabled = self.history_enabled;
+        config.history.interval_minutes = self
+            .history_interval
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(5)
+            .max(1);
         Ok(())
     }
 

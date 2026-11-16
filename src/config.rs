@@ -113,6 +113,37 @@ pub struct BackupConfig {
     pub auto_backup: bool,
 }
 
+/// What the editor opens on launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupMode {
+    /// Reopen the document that was active at last quit (historical default).
+    #[default]
+    Resume,
+    /// Always open the file configured in `startup_document`.
+    Fixed,
+    /// Start with an empty untitled sheet.
+    Blank,
+}
+
+/// Periodic editor snapshots stored in a local git repository.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    pub enabled: bool,
+    /// Minutes between snapshots of a changed document.
+    pub interval_minutes: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: 5,
+        }
+    }
+}
+
 pub const DEFAULT_AI_PROMPT: &str = "你是一位资深中文写作者，熟悉公众号、知乎、博客园等平台的行文风格。根据用户给出的主题，直接输出一篇结构完整的 Markdown 文章：第一行用一级标题作文章标题，正文用二级标题分节，适当使用列表、引用、表格或代码块；语言自然具体，避免空话和排比堆砌。只输出文章本身，不要写前言、开场白或结尾说明。";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -153,6 +184,12 @@ pub struct AppConfig {
     pub recent_files: Vec<String>,
     /// Restore the dark palette on the next launch.
     pub dark_mode: bool,
+    /// Which document the editor opens on launch.
+    pub startup_mode: StartupMode,
+    /// File opened when `startup_mode` is `Fixed`.
+    pub startup_document: Option<String>,
+    /// Periodic git-managed snapshots of open documents.
+    pub history: HistoryConfig,
 }
 
 impl Global for AppConfig {}
@@ -280,5 +317,39 @@ mod tests {
         let parsed = parse_install_paths(bom);
         assert_eq!(parsed.data_dir, "D:/data");
         assert_eq!(parsed.config_dir, "C:/config");
+    }
+
+    #[test]
+    fn old_config_without_new_fields_still_loads() {
+        // A config.json written before startup/history existed.
+        let old = r#"{
+            "ai": {"base_url": "https://api.example.com/v1", "api_key": "k", "model": "m"},
+            "dark_mode": true,
+            "last_document": "C:/notes/a.md",
+            "recent_files": ["C:/notes/a.md"]
+        }"#;
+        let config: AppConfig = serde_json::from_str(old).unwrap_or_default();
+        assert!(config.dark_mode);
+        assert_eq!(config.last_document.as_deref(), Some("C:/notes/a.md"));
+        assert_eq!(config.startup_mode, StartupMode::Resume);
+        assert!(config.startup_document.is_none());
+        assert!(!config.history.enabled);
+        assert_eq!(config.history.interval_minutes, 5);
+    }
+
+    #[test]
+    fn startup_mode_and_history_roundtrip() {
+        let mut config = AppConfig::default();
+        config.startup_mode = StartupMode::Fixed;
+        config.startup_document = Some("C:/notes/daily.md".into());
+        config.history.enabled = true;
+        config.history.interval_minutes = 1;
+
+        let json = serde_json::to_string(&config).unwrap();
+        let back: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.startup_mode, StartupMode::Fixed);
+        assert_eq!(back.startup_document.as_deref(), Some("C:/notes/daily.md"));
+        assert!(back.history.enabled);
+        assert_eq!(back.history.interval_minutes, 1);
     }
 }

@@ -1,9 +1,10 @@
 //! The application view: title bar, command toolbar, document sidebar,
 //! editor/preview workspace and status bar.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -30,7 +31,9 @@ use crate::actions::*;
 use crate::doc::{self, Document, Heading, Stats};
 use crate::publish::upload_local_images;
 use crate::ui::{AiForm, PromptKind, PromptState, PublishForm, SettingsForm, SidebarTab};
-use crate::{ai, backup, commands, config, git, imagebed, publish, theme, ui, widgets, workspace};
+use crate::{
+    ai, backup, commands, config, git, history, imagebed, publish, theme, ui, widgets, workspace,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -75,6 +78,22 @@ pub struct InkdownApp {
     chat_error: Option<String>,
     chat_use_doc: bool,
     chat_scroll: ScrollHandle,
+    /// One-click AI typesetting: preview first, apply on confirm.
+    format_open: bool,
+    format_busy: bool,
+    format_error: Option<String>,
+    format_preview: Option<Entity<TextViewState>>,
+    format_result: Option<String>,
+    /// Git-managed document history (opt-in via settings).
+    history_open: bool,
+    history_loading: bool,
+    history_versions: Vec<history::Version>,
+    history_selected: Option<String>,
+    history_preview: Option<Entity<TextViewState>>,
+    /// Per-document (last snapshot time, content hash) for the timer.
+    history_snap: HashMap<PathBuf, (Instant, u64)>,
+    /// One-shot warning when git is missing.
+    history_git_warned: bool,
     publish_open: bool,
     publish: PublishForm,
     prompt: Option<PromptState>,
@@ -105,6 +124,7 @@ enum BuiltinCommand {
     Table,
     Image,
     Ai,
+    Format,
     Time,
     CodeBlock,
     Quote,
@@ -117,10 +137,11 @@ enum BuiltinCommand {
 }
 
 impl BuiltinCommand {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Table,
         Self::Image,
         Self::Ai,
+        Self::Format,
         Self::Time,
         Self::CodeBlock,
         Self::Quote,
@@ -137,6 +158,7 @@ impl BuiltinCommand {
             Self::Table => "插入表格",
             Self::Image => "插入图片",
             Self::Ai => "询问 AI",
+            Self::Format => "AI 排版",
             Self::Time => "当前时间",
             Self::CodeBlock => "代码块",
             Self::Quote => "引用",
@@ -154,6 +176,7 @@ impl BuiltinCommand {
             Self::Table => "插入一个 3 列的 Markdown 表格",
             Self::Image => "从剪贴板或本地文件插入图片",
             Self::Ai => "打开对话窗口，问完可直接插入文稿",
+            Self::Format => "用 AI 规范排版全文，预览确认后再替换",
             Self::Time => "插入当前日期和时间",
             Self::CodeBlock => "插入带语言的围栏代码块",
             Self::Quote => "插入引用标记",
@@ -171,6 +194,7 @@ impl BuiltinCommand {
             Self::Table => "table 表格",
             Self::Image => "image picture photo 图片 照片",
             Self::Ai => "ai ask 询问 提问 生成",
+            Self::Format => "format 排版 ai 格式 整理",
             Self::Time => "time date clock now 时间 日期",
             Self::CodeBlock => "code fence 代码",
             Self::Quote => "quote 引用",
@@ -188,6 +212,7 @@ impl BuiltinCommand {
             Self::Table => IconName::Table,
             Self::Image => IconName::Image,
             Self::Ai => IconName::Sparkles,
+            Self::Format => IconName::WandSparkles,
             Self::Time => IconName::Clock,
             Self::CodeBlock => IconName::Code,
             Self::Quote => IconName::Quote,
@@ -247,6 +272,23 @@ fn chat_system_prompt(context: &str) -> String {
     }
 }
 
+/// The file the editor should open on launch, per the startup setting.
+/// `None` starts with an empty untitled sheet (or, for `Resume`, the
+/// historical behavior of nothing remembered yet).
+fn startup_restore_path(config: &config::AppConfig) -> Option<PathBuf> {
+    let stored = match config.startup_mode {
+        config::StartupMode::Resume => config.last_document.as_ref()?,
+        config::StartupMode::Fixed => config.startup_document.as_ref()?,
+        config::StartupMode::Blank => return None,
+    };
+    let trimmed = stored.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
 impl InkdownApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let config = cx
@@ -254,11 +296,12 @@ impl InkdownApp {
             .cloned()
             .unwrap_or_default();
 
-        // Restore the last real file if it is still on disk; otherwise start
-        // with a clean sheet and let the preview show the workbench. Demo
-        // documents stay opt-in so they never hide the user's own workspace.
-        let restored = config.last_document.as_ref().and_then(|stored| {
-            let path = PathBuf::from(stored);
+        // Open the file the startup setting points at (or the last one, or
+        // nothing); otherwise start with a clean sheet and let the preview
+        // show the workbench. Demo documents stay opt-in so they never hide
+        // the user's own workspace. A configured file that is missing starts
+        // blank — it never falls back to another mode.
+        let restored = startup_restore_path(&config).and_then(|path| {
             let content = std::fs::read_to_string(&path).ok()?;
             Some((path, content))
         });
@@ -388,6 +431,18 @@ impl InkdownApp {
             chat_error: None,
             chat_use_doc: false,
             chat_scroll: ScrollHandle::default(),
+            format_open: false,
+            format_busy: false,
+            format_error: None,
+            format_preview: None,
+            format_result: None,
+            history_open: false,
+            history_loading: false,
+            history_versions: Vec::new(),
+            history_selected: None,
+            history_preview: None,
+            history_snap: HashMap::new(),
+            history_git_warned: false,
             publish_open: false,
             publish,
             prompt: None,
@@ -492,7 +547,101 @@ impl InkdownApp {
                 })
                 .unwrap_or(true)
         });
+
+        // History snapshots run on a background loop so an idle editor costs
+        // one 30s timer per wake; the task ends with the entity.
+        let handle = cx.weak_entity();
+        cx.spawn_in(window, async move |_this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+                let ticked = handle
+                    .update(cx, |this, cx| this.history_tick(cx))
+                    .unwrap_or(false);
+                if !ticked {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         this
+    }
+
+    /// One 30-second history tick: snapshot open documents whose text changed
+    /// and whose interval has elapsed. Returns false only when the entity is
+    /// gone (used by the loop to stop).
+    fn history_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let config = cx.global::<config::AppConfig>().clone();
+        if !config.history.enabled {
+            return true;
+        }
+        if git::version().is_err() {
+            if !self.history_git_warned {
+                self.history_git_warned = true;
+                self.notice = Some("未检测到 git，历史版本不可用".to_string());
+                cx.notify();
+            }
+            return true;
+        }
+        let now = Instant::now();
+        let minutes = config.history.interval_minutes.max(1);
+        let due = minutes.saturating_mul(60);
+        // Snapshot every path-backed open document, not just the active one:
+        // a background tab must not lose its history when the timer fires.
+        let candidates: Vec<_> = self
+            .docs
+            .iter()
+            .filter_map(|doc| {
+                let path = doc.path.clone()?;
+                if doc.content.trim().is_empty() {
+                    return None;
+                }
+                let hash = history::content_hash(&doc.content);
+                let last = self.history_snap.get(&path);
+                // First sighting records the baseline and snapshots right away
+                // so turning the feature on produces an immediate version.
+                if let Some((at, seen)) = last {
+                    if *seen == hash || now.duration_since(*at).as_secs() < due {
+                        return None;
+                    }
+                }
+                Some((path, doc.content.clone(), hash))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return true;
+        }
+        let root = history::repo_dir();
+        for (path, content, hash) in candidates {
+            self.history_snap.insert(path.clone(), (now, hash));
+            let root = root.clone();
+            cx.spawn(async move |_this, cx| {
+                let file = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("文档")
+                    .to_string();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { history::snapshot(&root, &path, &content) })
+                    .await;
+                // Git failures (missing binary, locked repo) surface as a
+                // warning; successful snapshots stay silent.
+                if let Err(error) = result {
+                    let message = format!("历史版本保存失败（{file}）：{error}");
+                    _this
+                        .update(cx, |this, cx| {
+                            this.notice = Some(message);
+                            cx.notify();
+                        })
+                        .ok();
+                }
+            })
+            .detach();
+        }
+        true
     }
 
     fn sync_editor(&mut self, cx: &mut Context<Self>) {
@@ -1209,6 +1358,7 @@ impl InkdownApp {
                 BuiltinCommand::Table => self.insert_template(TABLE_TEMPLATE, window, cx),
                 BuiltinCommand::Image => self.insert_image_command(window, cx),
                 BuiltinCommand::Ai => self.open_chat(window, cx),
+                BuiltinCommand::Format => self.open_format(window, cx),
                 BuiltinCommand::Time => {
                     let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
                     self.insert_text(&now, window, cx);
@@ -1522,6 +1672,11 @@ impl InkdownApp {
                         .icon(IconName::GitBranch)
                         .action(Box::new(GitSync)),
                 )
+                .item(
+                    PopupMenuItem::new("历史版本…")
+                        .icon(IconName::FileClock)
+                        .action(Box::new(OpenHistory)),
+                )
             })
     }
 
@@ -1629,6 +1784,12 @@ impl InkdownApp {
                     PopupMenuItem::new("分隔线")
                         .icon(IconName::Minus)
                         .action(Box::new(FormatDivider)),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("AI 排版…")
+                        .icon(IconName::WandSparkles)
+                        .action(Box::new(AiFormat)),
                 )
             })
     }
@@ -1962,6 +2123,13 @@ impl InkdownApp {
                 "插入表格",
                 cx,
                 |this, window, cx| this.insert_template(TABLE_TEMPLATE, window, cx),
+            ))
+            .child(Self::tool(
+                "toolbar-ai-format",
+                IconName::WandSparkles,
+                "AI 排版：先预览再替换全文",
+                cx,
+                |this, window, cx| this.open_format(window, cx),
             ))
             .child(div().flex_1())
             .child(self.view_switcher(cx))
@@ -4140,6 +4308,571 @@ impl InkdownApp {
         .into_any_element()
     }
 
+    // ---- one-click AI typesetting ----------------------------------------
+
+    fn open_format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.slash = None;
+        if self.format_busy {
+            return;
+        }
+        let text = self.editor.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            self.notice = Some("空文档不需要排版".to_string());
+            cx.notify();
+            return;
+        }
+        let config = cx.global::<config::AppConfig>().ai.clone();
+        if config.base_url.trim().is_empty()
+            || config.api_key.trim().is_empty()
+            || config.model.trim().is_empty()
+        {
+            self.format_error =
+                Some("先在 设置 → AI 写作 里填写服务地址、API Key 和模型".to_string());
+            self.format_open = true;
+            self.format_busy = false;
+            self.format_preview = None;
+            self.format_result = None;
+            cx.notify();
+            return;
+        }
+
+        self.format_open = true;
+        self.format_busy = true;
+        self.format_error = None;
+        self.format_preview = None;
+        self.format_result = None;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { ai::format_document(&config, &text) })
+                .await;
+            this.update_in(cx, |this, _window, cx| {
+                this.format_busy = false;
+                match result {
+                    Ok(formatted) => {
+                        this.format_result = Some(formatted.clone());
+                        this.format_preview =
+                            Some(cx.new(|cx| TextViewState::markdown(&formatted, cx)));
+                    }
+                    Err(error) => this.format_error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Replace the whole document with the formatted result in one undo step.
+    fn apply_format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(result) = self.format_result.clone() else {
+            return;
+        };
+        self.format_open = false;
+        self.format_preview = None;
+        self.format_result = None;
+        self.format_error = None;
+        self.editor.update(cx, |state, cx| {
+            state.replace_all(result, window, cx);
+        });
+        self.after_edit(window, cx);
+        self.notice = Some("已应用 AI 排版，Ctrl+Z 可撤销".to_string());
+    }
+
+    fn format_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.modal_shell("format-overlay", cx)
+            .child(
+                v_flex()
+                    .w(px(760.))
+                    .h(relative(0.88))
+                    .max_h(px(720.))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .overflow_hidden()
+                    .occlude()
+                    .child(
+                        h_flex()
+                            .h(px(58.))
+                            .flex_shrink_0()
+                            .px_5()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                v_flex()
+                                    .gap_0()
+                                    .child(div().text_base().font_semibold().child("AI 排版"))
+                                    .child(
+                                        div()
+                                            .max_w(px(560.))
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if self.format_busy {
+                                                "正在整理标题、列表、表格与中英文间距…"
+                                            } else if self.format_result.is_some() {
+                                                "下面是排版后的全文，确认无误再替换"
+                                            } else {
+                                                "只调整排版，不改动任何文字内容"
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                Button::new("format-close")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::X)
+                                    .disabled(self.format_busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.format_open = false;
+                                        this.format_preview = None;
+                                        this.format_result = None;
+                                        this.format_error = None;
+                                        this.focus_editor(window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .id("format-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p_5()
+                            .when(self.format_busy, |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("正在排版，请稍候…"),
+                                )
+                            })
+                            .when_some(self.format_error.clone(), |this, error| {
+                                this.child(
+                                    div().text_sm().text_color(cx.theme().danger).child(error),
+                                )
+                            })
+                            .when_some(self.format_preview.as_ref(), |this, preview| {
+                                this.child(TextView::new(preview).w_full())
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .h(px(58.))
+                            .flex_shrink_0()
+                            .px_5()
+                            .gap_2()
+                            .items_center()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("替换会保留一步撤销记录，原文不会丢失"),
+                            )
+                            .child(
+                                Button::new("format-cancel")
+                                    .outline()
+                                    .xsmall()
+                                    .label("取消")
+                                    .disabled(self.format_busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.format_open = false;
+                                        this.format_preview = None;
+                                        this.format_result = None;
+                                        this.format_error = None;
+                                        this.focus_editor(window, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("format-apply")
+                                    .primary()
+                                    .xsmall()
+                                    .label("应用排版")
+                                    .disabled(self.format_busy || self.format_result.is_none())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.apply_format(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    // ---- document history -------------------------------------------------
+
+    fn open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.slash = None;
+        self.history_open = true;
+        self.history_loading = true;
+        self.history_versions.clear();
+        self.history_selected = None;
+        self.history_preview = None;
+        cx.notify();
+        self.load_history(window, cx);
+    }
+
+    fn load_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.docs.get(self.active).and_then(|doc| doc.path.clone()) else {
+            self.history_loading = false;
+            cx.notify();
+            return;
+        };
+        let root = history::repo_dir();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { history::versions(&root, &path) })
+                .await;
+            this.update_in(cx, |this, _window, cx| {
+                this.history_loading = false;
+                match result {
+                    Ok(versions) => this.history_versions = versions,
+                    Err(error) => {
+                        this.notice = Some(format!("读取历史版本失败：{error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn select_history_version(&mut self, rev: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history_selected.as_deref() == Some(rev.as_str()) {
+            return;
+        }
+        let Some(path) = self.docs.get(self.active).and_then(|doc| doc.path.clone()) else {
+            return;
+        };
+        self.history_selected = Some(rev.clone());
+        self.history_preview = None;
+        cx.notify();
+        let root = history::repo_dir();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { history::read(&root, &path, &rev) })
+                .await;
+            this.update_in(cx, |this, _window, cx| {
+                match result {
+                    Ok(text) => {
+                        this.history_preview =
+                            Some(cx.new(|cx| TextViewState::markdown(&text, cx)));
+                    }
+                    Err(error) => {
+                        this.notice = Some(format!("读取版本失败：{error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Restore the selected version into the editor. Not saved to disk —
+    /// the user decides when (Ctrl+S), and undo still works.
+    fn restore_history_version(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(path), Some(rev)) = (
+            self.docs.get(self.active).and_then(|doc| doc.path.clone()),
+            self.history_selected.clone(),
+        ) else {
+            return;
+        };
+        let root = history::repo_dir();
+        self.history_loading = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { history::read(&root, &path, &rev) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.history_loading = false;
+                match result {
+                    Ok(text) => {
+                        this.history_open = false;
+                        this.editor.update(cx, |state, cx| {
+                            state.replace_all(text, window, cx);
+                        });
+                        this.after_edit(window, cx);
+                        this.notice = Some("已恢复历史版本，Ctrl+S 保存后才会写入磁盘".to_string());
+                    }
+                    Err(error) => {
+                        this.notice = Some(format!("恢复失败：{error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Snapshot the active document immediately (the manual counterpart of
+    /// the interval timer).
+    fn history_snapshot_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.docs.get(self.active).and_then(|doc| doc.path.clone()) else {
+            self.notice = Some("未保存的文稿还没有路径，先 Ctrl+S 保存".to_string());
+            cx.notify();
+            return;
+        };
+        let content = self.editor.read(cx).value().to_string();
+        if content.trim().is_empty() {
+            self.notice = Some("空文档不需要存版本".to_string());
+            cx.notify();
+            return;
+        }
+        let root = history::repo_dir();
+        self.history_loading = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { history::snapshot(&root, &path, &content) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.history_loading = false;
+                match result {
+                    Ok(true) => {
+                        this.notice = Some("已保存当前版本".to_string());
+                        this.load_history(window, cx);
+                    }
+                    Ok(false) => {
+                        this.notice = Some("内容没有变化，未产生新版本".to_string());
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.notice = Some(format!("保存版本失败：{error}"));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn history_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let has_path = self
+            .docs
+            .get(self.active)
+            .is_some_and(|doc| doc.path.is_some());
+        let enabled = cx
+            .try_global::<config::AppConfig>()
+            .is_some_and(|config| config.history.enabled);
+        let rows = self
+            .history_versions
+            .iter()
+            .map(|version| {
+                let selected = self.history_selected.as_deref() == Some(version.rev.as_str());
+                let rev = version.rev.clone();
+                let subject = version.subject.clone();
+                h_flex()
+                    .id(SharedString::from(format!("history-row-{rev}")))
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_3()
+                    .rounded_md()
+                    .cursor(CursorStyle::PointingHand)
+                    .when(selected, |this| this.bg(cx.theme().muted))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_history_version(rev.clone(), window, cx);
+                    }))
+                    .child(
+                        Icon::new(IconName::FileClock)
+                            .xsmall()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(div().flex_1().min_w_0().text_sm().truncate().child(subject))
+                    .when(selected, |this| {
+                        this.child(
+                            Icon::new(IconName::Check)
+                                .xsmall()
+                                .text_color(cx.theme().primary),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        self.modal_shell("history-overlay", cx).child(
+            v_flex()
+                .w(px(720.))
+                .h(relative(0.86))
+                .max_h(px(680.))
+                .rounded_lg()
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().popover)
+                .overflow_hidden()
+                .occlude()
+                .child(
+                    h_flex()
+                        .h(px(58.))
+                        .flex_shrink_0()
+                        .px_5()
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            v_flex()
+                                .gap_0()
+                                .child(div().text_base().font_semibold().child("历史版本"))
+                                .child(
+                                    div()
+                                        .max_w(px(520.))
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if !has_path {
+                                            "未保存的文稿还没有路径，先 Ctrl+S 保存"
+                                        } else if self.history_loading {
+                                            "正在读取…"
+                                        } else if enabled {
+                                            "每 5 分钟自动存一版，也可随时手动保存"
+                                        } else {
+                                            "自动存版未开启（设置 → 历史版本），可手动保存"
+                                        }),
+                                ),
+                        )
+                        .child(
+                            Button::new("history-close")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::X)
+                                .disabled(self.history_loading)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.history_open = false;
+                                    this.focus_editor(window, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .id("history-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p_4()
+                        .gap_1()
+                        .when(self.history_loading && self.history_versions.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("正在读取…"),
+                            )
+                        })
+                        .when(
+                            !self.history_loading
+                                && self.history_versions.is_empty()
+                                && has_path,
+                            |this| {
+                                this.child(
+                                    v_flex()
+                                        .w_full()
+                                        .py_6()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Icon::new(IconName::FileClock)
+                                                .with_size(px(22.))
+                                                .text_color(cx.theme().muted_foreground),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("还没有版本，点下方「保存当前版本」存第一版"),
+                                        ),
+                                )
+                            },
+                        )
+                        .children(rows),
+                )
+                .child(
+                    v_flex()
+                        .flex_shrink_0()
+                        .px_5()
+                        .py_3()
+                        .gap_3()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .when_some(self.history_preview.as_ref(), |this, preview| {
+                            this.child(
+                                v_flex()
+                                    .id("history-preview")
+                                    .h(px(180.))
+                                    .min_h_0()
+                                    .overflow_hidden()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .p_3()
+                                    .child(TextView::new(preview).w_full().h_full()),
+                            )
+                        })
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if self.history_selected.is_some() {
+                                            "恢复不会自动保存，Ctrl+S 才写入磁盘"
+                                        } else {
+                                            "选中一个版本可以预览并恢复"
+                                        }),
+                                )
+                                .child(
+                                    Button::new("history-snapshot")
+                                        .outline()
+                                        .xsmall()
+                                        .icon(IconName::Save)
+                                        .label("保存当前版本")
+                                        .disabled(self.history_loading || !has_path)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.history_snapshot_now(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("history-restore")
+                                        .primary()
+                                        .xsmall()
+                                        .label("恢复此版本")
+                                        .disabled(
+                                            self.history_loading
+                                                || self.history_selected.is_none(),
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.restore_history_version(window, cx);
+                                        })),
+                                ),
+                        ),
+                ),
+        )
+        .into_any_element()
+    }
+
     fn ai_modal(&self, cx: &mut Context<Self>) -> AnyElement {
         let model = self.settings.ai_model.read(cx).value().to_string();
         let configured = cx
@@ -4930,6 +5663,23 @@ impl InkdownApp {
             cx.notify();
             return;
         }
+        if self.format_open {
+            if !self.format_busy {
+                self.format_open = false;
+                self.format_preview = None;
+                self.format_result = None;
+                self.format_error = None;
+                cx.notify();
+            }
+            return;
+        }
+        if self.history_open {
+            if !self.history_loading {
+                self.history_open = false;
+                cx.notify();
+            }
+            return;
+        }
         if self.meta_open {
             self.meta_open = false;
             cx.notify();
@@ -4960,6 +5710,14 @@ impl InkdownApp {
 
     fn on_ai_write(&mut self, _: &AiWrite, window: &mut Window, cx: &mut Context<Self>) {
         self.open_ai(window, cx);
+    }
+
+    fn on_ai_format(&mut self, _: &AiFormat, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_format(window, cx);
+    }
+
+    fn on_open_history(&mut self, _: &OpenHistory, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_history(window, cx);
     }
 
     fn on_open_settings_action(
@@ -5067,6 +5825,49 @@ impl InkdownApp {
                         .overflow_y_scroll()
                         .p_5()
                         .gap_4()
+                        .child(
+                            v_flex()
+                                .gap_3()
+                                .p_4()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(self.section_header(
+                                    "启动",
+                                    "决定打开程序时编辑器里出现什么，修改后下次启动生效。",
+                                    cx,
+                                ))
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(self.startup_mode_button(
+                                            "恢复上次文稿",
+                                            config::StartupMode::Resume,
+                                            cx,
+                                        ))
+                                        .child(self.startup_mode_button(
+                                            "打开指定文件",
+                                            config::StartupMode::Fixed,
+                                            cx,
+                                        ))
+                                        .child(self.startup_mode_button(
+                                            "新建空白",
+                                            config::StartupMode::Blank,
+                                            cx,
+                                        )),
+                                )
+                                .when(
+                                    self.settings.startup_mode == config::StartupMode::Fixed,
+                                    |this| {
+                                        this.child(self.settings_field(
+                                            "默认文稿",
+                                            "启动时打开的 Markdown 绝对路径",
+                                            &self.settings.startup_document,
+                                            cx,
+                                        ))
+                                    },
+                                ),
+                        )
                         .child(
                             v_flex()
                                 .gap_3()
@@ -5401,6 +6202,37 @@ impl InkdownApp {
                                 ),
                         )
                         .child(
+                            v_flex()
+                                .gap_3()
+                                .p_4()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(self.section_header(
+                                    "历史版本",
+                                    "用本机 git 定时把打开中的文稿存为版本，可在“文件 → 历史版本”里查看和恢复。",
+                                    cx,
+                                ))
+                                .child(self.toggle_row(
+                                    "history-enabled",
+                                    "启用历史版本",
+                                    "默认关闭；每 N 分钟把改动过的文稿（含未保存修改）存一版",
+                                    self.settings.history_enabled,
+                                    true,
+                                    cx,
+                                    |this| {
+                                        this.settings.history_enabled =
+                                            !this.settings.history_enabled;
+                                    },
+                                ))
+                                .child(self.settings_field(
+                                    "快照间隔（分钟）",
+                                    "默认 5，最小 1",
+                                    &self.settings.history_interval,
+                                    cx,
+                                )),
+                        )
+                        .child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
@@ -5512,6 +6344,24 @@ impl InkdownApp {
             .selected(self.settings.image_kind == kind)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.settings.image_kind = kind;
+                this.flush_settings(cx).ok();
+                cx.notify();
+            }))
+    }
+
+    fn startup_mode_button(
+        &self,
+        label: &'static str,
+        mode: config::StartupMode,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        Button::new(label)
+            .ghost()
+            .xsmall()
+            .label(label)
+            .selected(self.settings.startup_mode == mode)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.settings.startup_mode = mode;
                 this.flush_settings(cx).ok();
                 cx.notify();
             }))
@@ -7133,6 +7983,8 @@ impl Render for InkdownApp {
             .when(self.publish_open, |this| this.child(self.publish_modal(cx)))
             .when(self.ai_open, |this| this.child(self.ai_modal(cx)))
             .when(self.chat_open, |this| this.child(self.chat_modal(cx)))
+            .when(self.format_open, |this| this.child(self.format_modal(cx)))
+            .when(self.history_open, |this| this.child(self.history_modal(cx)))
             .when(self.close_confirm.is_some(), |this| {
                 this.child(self.close_confirm_modal(cx))
             })
@@ -7163,6 +8015,8 @@ impl Render for InkdownApp {
             .on_action(cx.listener(Self::on_reveal_in_files))
             .on_action(cx.listener(Self::on_publish_action))
             .on_action(cx.listener(Self::on_ai_write))
+            .on_action(cx.listener(Self::on_ai_format))
+            .on_action(cx.listener(Self::on_open_history))
             .on_action(cx.listener(Self::on_open_settings_action))
             .on_action(cx.listener(Self::on_backup_action))
             .on_action(cx.listener(Self::on_git_sync_action))
@@ -7249,5 +8103,41 @@ mod chat_tests {
         let prompt = chat_system_prompt("  # 标题\n\n正文  ");
         assert!(prompt.starts_with(ai::CHAT_SYSTEM_PROMPT));
         assert!(prompt.contains("<document>\n# 标题\n\n正文\n</document>"));
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::startup_restore_path;
+    use crate::config::{AppConfig, StartupMode};
+
+    #[test]
+    fn startup_path_follows_the_configured_mode() {
+        let mut config = AppConfig::default();
+        config.last_document = Some("C:/notes/last.md".to_string());
+        config.startup_document = Some("C:/notes/fixed.md".to_string());
+
+        // Resume (default) reopens whatever was active at last quit.
+        assert_eq!(
+            startup_restore_path(&config),
+            Some(std::path::PathBuf::from("C:/notes/last.md"))
+        );
+
+        config.startup_mode = StartupMode::Fixed;
+        assert_eq!(
+            startup_restore_path(&config),
+            Some(std::path::PathBuf::from("C:/notes/fixed.md"))
+        );
+
+        // Blank never opens a file, even when both paths are set.
+        config.startup_mode = StartupMode::Blank;
+        assert_eq!(startup_restore_path(&config), None);
+
+        // Fixed with nothing configured falls back to an empty sheet.
+        config.startup_mode = StartupMode::Fixed;
+        config.startup_document = None;
+        assert_eq!(startup_restore_path(&config), None);
+        config.startup_document = Some("   ".to_string());
+        assert_eq!(startup_restore_path(&config), None);
     }
 }

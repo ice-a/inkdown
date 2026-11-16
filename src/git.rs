@@ -6,7 +6,7 @@ use std::process::Command;
 
 use crate::config::GitConfig;
 
-fn command(root: &Path) -> Command {
+pub(crate) fn command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(root);
     command.env("GIT_TERMINAL_PROMPT", "0");
@@ -40,7 +40,7 @@ pub fn is_repo(root: &Path) -> bool {
     root.join(".git").exists()
 }
 
-fn run(root: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = command(root)
         .args(args)
         .output()
@@ -53,6 +53,25 @@ fn run(root: &Path, args: &[&str]) -> Result<String, String> {
         Err(stdout)
     } else {
         Err(stderr)
+    }
+}
+
+/// Like [`run`], but returns stdout untouched — for reading stored file
+/// contents where trailing newlines are part of the payload.
+pub(crate) fn run_raw(root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = command(root)
+        .args(args)
+        .output()
+        .map_err(|error| format!("执行 git 失败：{error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            stderr
+        })
     }
 }
 

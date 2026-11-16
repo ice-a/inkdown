@@ -235,6 +235,26 @@ pub fn chat(config: &AiConfig, system: &str, turns: &[ChatTurn]) -> Result<Strin
         })
 }
 
+/// System prompt for the one-click typesetting pass. Formatting only — the
+/// document's wording, order and meaning must survive untouched.
+pub const FORMAT_SYSTEM_PROMPT: &str = "你是 Markdown 排版助手。只调整排版，不改动任何文字内容、不增删段落、不改写语义。要求：统一标题层级（一级到三级依次使用 #、##、###，不跳级）；列表项缩进与符号统一（无序用 -，有序用 1. 2. 3.）；表格列对齐并补全管道符；代码块保留围栏并标注语言；段落之间保留一个空行；中英文之间、数字与中文之间加一个空格；修正明显的中英文标点混用。直接输出排版后的完整 Markdown 正文，不要用代码围栏包裹，不要输出任何解释。";
+
+/// POST {base}/chat/completions — typeset one whole document.
+///
+/// The full text goes out untruncated: dropping content in a formatting pass
+/// would silently lose the author's words.
+pub fn format_document(config: &AiConfig, text: &str) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Err("空文档不需要排版".to_string());
+    }
+    let turns = [ChatTurn {
+        role: "user".to_string(),
+        content: format!("<document>\n{text}\n</document>"),
+    }];
+    let result = chat(config, FORMAT_SYSTEM_PROMPT, &turns)?;
+    Ok(clean_markdown(&result))
+}
+
 /// Strip a leading ```` ```markdown ```` fence some models wrap output in.
 pub fn clean_markdown(text: &str) -> String {
     let trimmed = text.trim_start_matches(['\r', '\n']);
@@ -424,5 +444,57 @@ mod tests {
         assert!(body.contains("\"role\":\"system\""));
         assert!(body.contains("\"role\":\"assistant\""));
         assert!(first_user < first_assistant && first_assistant < second_user);
+    }
+
+    #[test]
+    fn formats_full_document_with_format_prompt() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Content-Length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = reader.into_inner();
+            let response = r##"{"choices":[{"message":{"content":"```markdown\n# 排版后的标题\n\n正文。\n```"}}]}"##;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        });
+
+        let config = AiConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key: "sk-test".to_string(),
+            model: "ink-format".to_string(),
+            prompt: String::new(),
+        };
+        // A long document: the formatting pass must not truncate it.
+        let document = format!("# 标题\n\n{}", "内容段落。".repeat(500));
+        let formatted = format_document(&config, &document).unwrap();
+        // clean_markdown strips the wrapping fence the model returned.
+        assert!(formatted.starts_with("# 排版后的标题"));
+        assert!(!formatted.contains("```"));
+
+        let body = server.join().unwrap();
+        assert!(body.contains("Markdown 排版助手"));
+        assert!(body.contains("内容段落。内容段落。"));
+        assert!(body.contains("<document>"));
     }
 }

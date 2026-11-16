@@ -12,6 +12,7 @@ mod commands;
 mod config;
 mod doc;
 mod git;
+mod history;
 mod imagebed;
 mod publish;
 mod theme;
