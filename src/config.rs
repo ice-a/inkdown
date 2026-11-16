@@ -144,6 +144,58 @@ impl Default for HistoryConfig {
     }
 }
 
+/// Where the code-check model is downloaded from. All three mirror the same
+/// repository, so switching only changes the host — domestic links stay fast
+/// and international ones stay reachable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckSource {
+    /// 魔搭 ModelScope (domestic).
+    #[default]
+    ModelScope,
+    /// HuggingFace (international).
+    HuggingFace,
+    /// hf-mirror.com (domestic HuggingFace mirror).
+    HfMirror,
+}
+
+/// Which engine runs the code check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckMode {
+    /// A downloaded GGUF model run offline through llama.cpp.
+    #[default]
+    Local,
+    /// The OpenAI-compatible endpoint configured in 设置 → AI 写作.
+    Api,
+}
+
+/// Basic code validation over fenced blocks, local model or AI endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeCheckConfig {
+    /// Off by default: the feature needs a model download (or AI config) first.
+    pub enabled: bool,
+    pub source: CheckSource,
+    pub mode: CheckMode,
+    /// Which entry of the model catalog is selected for `Local` mode.
+    pub local_model: String,
+    /// Where model files live; empty means the default `data/models`.
+    pub models_dir: String,
+}
+
+impl Default for CodeCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: CheckSource::ModelScope,
+            mode: CheckMode::Local,
+            local_model: "qwen2.5-coder-0.5b".to_string(),
+            models_dir: String::new(),
+        }
+    }
+}
+
 pub const DEFAULT_AI_PROMPT: &str = "你是一位资深中文写作者，熟悉公众号、知乎、博客园等平台的行文风格。根据用户给出的主题，直接输出一篇结构完整的 Markdown 文章：第一行用一级标题作文章标题，正文用二级标题分节，适当使用列表、引用、表格或代码块；语言自然具体，避免空话和排比堆砌。只输出文章本身，不要写前言、开场白或结尾说明。";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -190,6 +242,8 @@ pub struct AppConfig {
     pub startup_document: Option<String>,
     /// Periodic git-managed snapshots of open documents.
     pub history: HistoryConfig,
+    /// Local small-model validation of fenced code blocks.
+    pub code_check: CodeCheckConfig,
 }
 
 impl Global for AppConfig {}
@@ -335,6 +389,11 @@ mod tests {
         assert!(config.startup_document.is_none());
         assert!(!config.history.enabled);
         assert_eq!(config.history.interval_minutes, 5);
+        assert!(!config.code_check.enabled);
+        assert_eq!(config.code_check.source, CheckSource::ModelScope);
+        assert_eq!(config.code_check.mode, CheckMode::Local);
+        assert_eq!(config.code_check.local_model, "qwen2.5-coder-0.5b");
+        assert_eq!(config.code_check.models_dir, "");
     }
 
     #[test]
@@ -345,11 +404,19 @@ mod tests {
         config.history.enabled = true;
         config.history.interval_minutes = 1;
 
+        config.code_check.enabled = true;
+        config.code_check.mode = CheckMode::Api;
+        config.code_check.local_model = "qwen2.5-coder-3b".into();
+        config.code_check.models_dir = "D:/models".into();
+
         let json = serde_json::to_string(&config).unwrap();
         let back: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.startup_mode, StartupMode::Fixed);
         assert_eq!(back.startup_document.as_deref(), Some("C:/notes/daily.md"));
         assert!(back.history.enabled);
         assert_eq!(back.history.interval_minutes, 1);
+        assert_eq!(back.code_check.mode, CheckMode::Api);
+        assert_eq!(back.code_check.local_model, "qwen2.5-coder-3b");
+        assert_eq!(back.code_check.models_dir, "D:/models");
     }
 }

@@ -3,3 +3,7 @@
 .DS_Store
 Thumbs.db
 .zcode/
+# Local packaging leftovers: the exe copied to the repo root for setup.nsi
+# and ad-hoc local installers (CI artifacts are uploaded, never committed).
+/inkdown.exe
+/Inkdown-*-local-setup.exe

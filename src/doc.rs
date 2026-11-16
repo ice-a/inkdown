@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use gpui_kit::SharedString;
-use pulldown_cmark::{Options, Parser, html};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
 
 #[derive(Clone)]
 pub struct Document {
@@ -263,12 +263,135 @@ pub const CODE_LANGUAGES: &[(&str, &str)] = &[
     ("zsh", "Zsh"),
 ];
 
-/// The picker's display name for a fence language token, when it knows it.
-pub fn code_language_display(token: &str) -> Option<&'static str> {
+/// Hand-written fence tokens people actually type, mapped onto a token the
+/// picker offers. One table feeds three things: the preview highlighter, the
+/// chip's display name and the picker search — so ` ```golang ` colours and
+/// labels like Go instead of falling back to plain text.
+pub const LANG_ALIASES: &[(&str, &str)] = &[
+    ("c#", "csharp"),
+    ("c++", "cpp"),
+    ("docker", "dockerfile"),
+    ("golang", "go"),
+    ("js", "javascript"),
+    ("jsx", "tsx"),
+    ("kt", "kotlin"),
+    ("make", "makefile"),
+    ("md", "markdown"),
+    ("node", "javascript"),
+    ("nodejs", "javascript"),
+    ("objc", "objective-c"),
+    ("pl", "perl"),
+    ("py", "python"),
+    ("py3", "python"),
+    ("python3", "python"),
+    ("rb", "ruby"),
+    ("rs", "rust"),
+    ("sh", "bash"),
+    ("shell", "bash"),
+    ("shellscript", "bash"),
+    ("tex", "latex"),
+    ("tf", "terraform"),
+    ("typescript", "ts"),
+    ("yml", "yaml"),
+];
+
+/// Resolve a fence token to a picker token: trimmed, lowercased, aliases
+/// rewritten. `None` means the token is unknown — the caller keeps the raw
+/// text (the grammar set may still know it, and the chip shows it verbatim).
+pub fn normalize_code_lang(token: &str) -> Option<&'static str> {
+    let lower = token.trim().to_lowercase();
+    if let Some((_, target)) = LANG_ALIASES.iter().find(|(alias, _)| *alias == lower) {
+        return Some(target);
+    }
     CODE_LANGUAGES
         .iter()
-        .find(|(known, _)| *known == token)
+        .find(|(known, _)| *known == lower)
+        .map(|(known, _)| *known)
+}
+
+/// The picker's display name for a fence language token, when it knows it.
+pub fn code_language_display(token: &str) -> Option<&'static str> {
+    let canonical = normalize_code_lang(token)?;
+    CODE_LANGUAGES
+        .iter()
+        .find(|(known, _)| *known == canonical)
         .map(|(_, display)| *display)
+}
+
+/// Languages matching `query`, sorted by display name. The empty query
+/// returns everything. Matching is case-insensitive against the token, the
+/// display name and the hand-written aliases, so `golang` finds Go.
+pub fn filter_languages(query: &str) -> Vec<(&'static str, &'static str)> {
+    let mut list: Vec<(&str, &str)> = CODE_LANGUAGES.to_vec();
+    list.sort_by(|a, b| a.1.cmp(b.1));
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return list;
+    }
+    list.retain(|(token, display)| {
+        token.to_lowercase().contains(&query)
+            || display.to_lowercase().contains(&query)
+            || LANG_ALIASES
+                .iter()
+                .any(|(alias, target)| *target == *token && alias.contains(&query))
+    });
+    list
+}
+
+/// One fenced code block in the document, as the validator and the preview
+/// chip need it. `fence_start` is the byte offset of the block's opening
+/// fence — the same span `code_block_actions` reports, so issue markers line
+/// up with the rendered block.
+#[derive(Clone, Debug)]
+pub struct CodeBlockSpan {
+    pub lang: String,
+    pub code: String,
+    pub fence_start: usize,
+    /// 1-based document line of the block's first code line — the line the
+    /// fence opens above for fenced blocks, the content line itself for
+    /// indented ones.
+    pub line: usize,
+}
+
+/// Every fenced code block in `source`, in document order.
+pub fn code_blocks(source: &str) -> Vec<CodeBlockSpan> {
+    let parser = Parser::new_ext(source, Options::empty()).into_offset_iter();
+    let mut blocks = Vec::new();
+    let mut current: Option<(String, String, usize, usize)> = None;
+    for (event, range) in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let (lang, fenced) = match kind {
+                    CodeBlockKind::Fenced(lang) => (lang.to_string(), true),
+                    CodeBlockKind::Indented => (String::new(), false),
+                };
+                let fence_line = source[..range.start]
+                    .bytes()
+                    .filter(|b| *b == b'\n')
+                    .count()
+                    + 1;
+                let line = if fenced { fence_line + 1 } else { fence_line };
+                current = Some((lang, String::new(), range.start, line));
+            }
+            Event::Text(text) => {
+                if let Some((_, buffer, _, _)) = current.as_mut() {
+                    buffer.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((lang, code, fence_start, line)) = current.take() {
+                    blocks.push(CodeBlockSpan {
+                        lang,
+                        code,
+                        fence_start,
+                        line,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
 }
 
 /// The byte range of the language word on the opening fence line of the code
@@ -952,5 +1075,84 @@ mod tests {
             assert_eq!(code_language_display(token), Some(*display));
         }
         assert_eq!(code_language_display("no-such-language"), None);
+    }
+
+    #[test]
+    fn alias_targets_are_picker_tokens() {
+        for (alias, target) in LANG_ALIASES {
+            assert!(!alias.is_empty());
+            assert!(
+                CODE_LANGUAGES.iter().any(|(known, _)| known == target),
+                "alias {alias} points at unknown token {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_aliases_and_hand_typed_case() {
+        assert_eq!(normalize_code_lang("golang"), Some("go"));
+        assert_eq!(normalize_code_lang(" GoLAng "), Some("go"));
+        assert_eq!(normalize_code_lang("Rust"), Some("rust"));
+        assert_eq!(normalize_code_lang("c++"), Some("cpp"));
+        assert_eq!(normalize_code_lang("shell"), Some("bash"));
+        assert_eq!(normalize_code_lang("typescript"), Some("ts"));
+        assert_eq!(normalize_code_lang("no-such-language"), None);
+        // Display follows the same path, so aliases label correctly.
+        assert_eq!(code_language_display("golang"), Some("Go"));
+        assert_eq!(code_language_display("NODE"), Some("JavaScript"));
+    }
+
+    #[test]
+    fn filters_languages_by_token_display_and_alias() {
+        // Empty query: everything, display-sorted.
+        let all = filter_languages("");
+        assert_eq!(all.len(), CODE_LANGUAGES.len());
+        let sorted = filter_languages("rust");
+        assert_eq!(sorted, vec![("rust", "Rust")]);
+
+        // Token, display and alias all find Go.
+        assert!(filter_languages("go").iter().any(|(t, _)| *t == "go"));
+        assert!(filter_languages("golang").iter().any(|(t, _)| *t == "go"));
+        assert!(filter_languages("GO").iter().any(|(t, _)| *t == "go"));
+
+        // Display-name match, case-insensitive.
+        let cpp = filter_languages("c++");
+        assert_eq!(cpp, vec![("cpp", "C++")]);
+
+        assert!(filter_languages("没有这种语言").is_empty());
+    }
+
+    #[test]
+    fn collects_code_blocks_with_spans_and_lines() {
+        let source = "# t\n\n```rust\nlet x = 1;\n```\n\nplain\n\n    indented code\n\n```js\nlet y = 2;\n```\n";
+        let blocks = code_blocks(source);
+        // rust fence + the 4-space indented block + js fence.
+        assert_eq!(blocks.len(), 3);
+
+        let rust = &blocks[0];
+        assert_eq!(rust.lang, "rust");
+        assert_eq!(rust.code, "let x = 1;\n");
+        // line = first code line, not the fence above it.
+        assert_eq!(rust.line, 4);
+        // fence_start is the byte offset of the ``` that opens the block —
+        // the same key code_block_actions reports.
+        assert!(source[rust.fence_start..].starts_with("```rust"));
+
+        let indented = &blocks[1];
+        assert!(indented.lang.is_empty());
+        assert_eq!(indented.code, "indented code\n");
+        assert_eq!(indented.line, 9);
+
+        let js = &blocks[2];
+        assert_eq!(js.lang, "js");
+        assert_eq!(js.code, "let y = 2;\n");
+        assert_eq!(js.line, 12);
+        assert!(source[js.fence_start..].starts_with("```js"));
+
+        // A fence without a language still counts, with an empty lang.
+        let bare = code_blocks("```\nplain\n```");
+        assert_eq!(bare.len(), 1);
+        assert!(bare[0].lang.is_empty());
+        assert_eq!(bare[0].line, 2);
     }
 }

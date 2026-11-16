@@ -43,6 +43,7 @@ actions!(
         PublishArticle,
         AiWrite,
         AiFormat,
+        CheckCode,
         OpenSettings,
         CreateBackup,
         GitSync,

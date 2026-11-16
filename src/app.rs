@@ -32,7 +32,8 @@ use crate::doc::{self, Document, Heading, Stats};
 use crate::publish::upload_local_images;
 use crate::ui::{AiForm, PromptKind, PromptState, PublishForm, SettingsForm, SidebarTab};
 use crate::{
-    ai, backup, commands, config, git, history, imagebed, publish, theme, ui, widgets, workspace,
+    ai, backup, commands, config, git, history, imagebed, publish, theme, ui, validate, widgets,
+    workspace,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,6 +95,23 @@ pub struct InkdownApp {
     history_snap: HashMap<PathBuf, (Instant, u64)>,
     /// One-shot warning when git is missing.
     history_git_warned: bool,
+    /// Code-check modal: findings from the local small model.
+    validate_open: bool,
+    validate_busy: bool,
+    validate_error: Option<String>,
+    validate_issues: Vec<validate::CodeIssue>,
+    /// How many blocks the last run actually checked.
+    validate_checked: usize,
+    /// True while the settings model download streams to disk.
+    downloading: bool,
+    /// Which model the next/last check runs with — shown in the modal so
+    /// nothing is a black box.
+    validate_model_label: String,
+    /// Label of the run that produced [`Self::validate_issues`]; a mismatch
+    /// with the current label means those issues are stale and must rerun.
+    validate_ran_label: String,
+    /// Hardware probe is one-shot; kicked off from open_settings.
+    hardware_started: bool,
     publish_open: bool,
     publish: PublishForm,
     prompt: Option<PromptState>,
@@ -109,6 +127,9 @@ pub struct InkdownApp {
     recent: Vec<PathBuf>,
     slash: Option<SlashState>,
     code_lang: Option<CodeLangPicker>,
+    /// Search box filtering the language picker; lives outside the picker so
+    /// its subscription never needs re-wiring.
+    code_lang_query: Entity<InputState>,
     custom_commands: Vec<commands::CustomCommand>,
 }
 
@@ -134,10 +155,11 @@ enum BuiltinCommand {
     Metadata,
     OpenCommands,
     NewCommandTemplates,
+    Validate,
 }
 
 impl BuiltinCommand {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Table,
         Self::Image,
         Self::Ai,
@@ -151,6 +173,7 @@ impl BuiltinCommand {
         Self::Metadata,
         Self::OpenCommands,
         Self::NewCommandTemplates,
+        Self::Validate,
     ];
 
     fn name(self) -> &'static str {
@@ -168,6 +191,7 @@ impl BuiltinCommand {
             Self::Metadata => "文档元数据",
             Self::OpenCommands => "打开命令目录",
             Self::NewCommandTemplates => "生成命令模板",
+            Self::Validate => "校验代码",
         }
     }
 
@@ -186,6 +210,7 @@ impl BuiltinCommand {
             Self::Metadata => "编辑文档开头的 YAML frontmatter",
             Self::OpenCommands => "在文件管理器中打开自定义命令目录",
             Self::NewCommandTemplates => "生成 JS / Python 示例命令和说明",
+            Self::Validate => "用本地小模型检查文档里的代码块",
         }
     }
 
@@ -204,6 +229,7 @@ impl BuiltinCommand {
             Self::Metadata => "metadata frontmatter 元数据",
             Self::OpenCommands => "custom script folder 命令 目录 自定义",
             Self::NewCommandTemplates => "template example custom 模板 示例 自定义",
+            Self::Validate => "校验 lint check 代码 语法 validate",
         }
     }
 
@@ -222,6 +248,7 @@ impl BuiltinCommand {
             Self::Metadata => IconName::Type,
             Self::OpenCommands => IconName::FolderCog,
             Self::NewCommandTemplates => IconName::FilePlus,
+            Self::Validate => IconName::Bug,
         }
     }
 }
@@ -272,6 +299,48 @@ fn chat_system_prompt(context: &str) -> String {
     }
 }
 
+/// Settings copy for the hardware probe: what the machine is, then what this
+/// build can really run — a CPU-only build never pretends otherwise.
+fn describe_hardware(hardware: &validate::Hardware) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(cores) = hardware.cores {
+        if hardware.cpu.is_empty() {
+            parts.push(format!("CPU ×{cores}"));
+        } else {
+            parts.push(format!("{}（×{cores}）", hardware.cpu));
+        }
+    } else if !hardware.cpu.is_empty() {
+        parts.push(hardware.cpu.clone());
+    }
+    if let Some(ram) = hardware.ram_gb {
+        parts.push(format!("内存 {ram} GB"));
+    }
+    if let Some(gpu) = &hardware.gpu {
+        match hardware.vram_gb {
+            Some(vram) if vram > 0 => parts.push(format!("显卡 {gpu}（{vram} GB）")),
+            _ => parts.push(format!("显卡 {gpu}")),
+        }
+    }
+    if hardware.backends.is_empty() {
+        parts.push("推理后端未知".to_string());
+    } else {
+        let gpu_accelerated = hardware
+            .backends
+            .iter()
+            .any(|backend| !backend.starts_with("CPU"));
+        let suffix = if hardware.gpu.is_some() && !gpu_accelerated {
+            "（本构建未启用 GPU 加速，按 CPU 选型）"
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "推理后端：{}{suffix}",
+            hardware.backends.join("、")
+        ));
+    }
+    parts.join(" · ")
+}
+
 /// The file the editor should open on launch, per the startup setting.
 /// `None` starts with an empty untitled sheet (or, for `Resume`, the
 /// historical behavior of nothing remembered yet).
@@ -295,6 +364,9 @@ impl InkdownApp {
             .try_global::<config::AppConfig>()
             .cloned()
             .unwrap_or_default();
+        // The model folder may live anywhere; seed the validator before any
+        // download status renders.
+        validate::set_models_dir(Some(config.code_check.models_dir.clone().into()));
 
         // Open the file the startup setting points at (or the last one, or
         // nothing); otherwise start with a clean sheet and let the preview
@@ -354,6 +426,11 @@ impl InkdownApp {
         });
         let preview = cx.new(|cx| TextViewState::markdown(&first, cx));
         let preview_find = cx.new(|cx| InputState::new(window, cx).placeholder("在预览中查找"));
+        let code_lang_query = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("搜索语言，如 go、python、golang…")
+                .submit_on_enter(true)
+        });
         let outline = doc::outline(&first);
         let stats = doc::stats(&first);
 
@@ -443,6 +520,15 @@ impl InkdownApp {
             history_preview: None,
             history_snap: HashMap::new(),
             history_git_warned: false,
+            validate_open: false,
+            validate_busy: false,
+            validate_error: None,
+            validate_issues: Vec::new(),
+            validate_checked: 0,
+            downloading: false,
+            validate_model_label: String::new(),
+            validate_ran_label: String::new(),
+            hardware_started: false,
             publish_open: false,
             publish,
             prompt: None,
@@ -455,6 +541,7 @@ impl InkdownApp {
             recent,
             slash: None,
             code_lang: None,
+            code_lang_query: code_lang_query.clone(),
             custom_commands: Vec::new(),
         };
 
@@ -477,6 +564,13 @@ impl InkdownApp {
         this._subscriptions.push(change_sub);
         this._subscriptions.push(cursor_sub);
         this._subscriptions.push(find_sub);
+        // The picker filters from render state, so a Change only needs a pass.
+        let lang_query_sub = cx.subscribe(&code_lang_query, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) && this.code_lang.is_some() {
+                cx.notify();
+            }
+        });
+        this._subscriptions.push(lang_query_sub);
 
         // Slash-palette navigation is intercepted before the keymap so the
         // editor's own Up/Down/Enter/Tab/Escape bindings cannot win.
@@ -1004,6 +1098,9 @@ impl InkdownApp {
     }
 
     fn code_block(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The opening fence lands wherever the edit starts: the caret for an
+        // empty selection, the selection start otherwise.
+        let fence = self.editor.read(cx).selected_range().start;
         self.editor.update(cx, |state, cx| {
             let selected = state.selected_text().to_string();
             if selected.is_empty() {
@@ -1015,13 +1112,40 @@ impl InkdownApp {
             }
         });
         self.after_edit(window, cx);
+        self.open_code_lang(fence, String::new(), window, cx);
     }
 
     /// Open the code-block language picker for the fence at `fence`.
-    fn open_code_lang(&mut self, fence: usize, current: String, cx: &mut Context<Self>) {
+    fn open_code_lang(
+        &mut self,
+        fence: usize,
+        current: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.slash = None;
         self.code_lang = Some(CodeLangPicker { fence, current });
+        self.code_lang_query
+            .update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        let focus = self.code_lang_query.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
         cx.notify();
+    }
+
+    /// Enter in the picker's search box picks the first match.
+    fn on_code_lang_enter(
+        &mut self,
+        _: &gpui_kit::component::input::Enter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.code_lang.is_none() {
+            return;
+        }
+        let query = self.code_lang_query.read(cx).value().to_string();
+        if let Some((token, _)) = doc::filter_languages(&query).into_iter().next() {
+            self.set_code_lang(token, window, cx);
+        }
     }
 
     /// Write `token` on the fence the picker was opened for. An empty token
@@ -1320,6 +1444,16 @@ impl InkdownApp {
             return;
         }
         self.execute_slash_action(action, query, window, cx);
+        // Removing the trigger edits the document, and that Change event
+        // flushes after this handler — sync_editor would wipe any notice the
+        // dispatch just set (校验代码's gate, 打开命令目录's path, …).
+        // Park it for the next frame, past the flush.
+        if let Some(notice) = self.notice.take() {
+            cx.on_next_frame(window, move |this, _, cx| {
+                this.notice = Some(notice);
+                cx.notify();
+            });
+        }
     }
 
     /// Remove the `/query` text, leaving the caret where the slash started.
@@ -1366,7 +1500,7 @@ impl InkdownApp {
                 BuiltinCommand::CodeBlock => {
                     let fence = self.editor.read(cx).selected_range().start;
                     self.insert_text_with_cursor("```\n\n```", 4, window, cx);
-                    self.open_code_lang(fence, String::new(), cx);
+                    self.open_code_lang(fence, String::new(), window, cx);
                 }
                 BuiltinCommand::Quote => self.toggle_line_prefix("> ", window, cx),
                 BuiltinCommand::Todo => self.insert_text("- [ ] ", window, cx),
@@ -1403,6 +1537,7 @@ impl InkdownApp {
                     }
                     cx.notify();
                 }
+                BuiltinCommand::Validate => self.open_validate(window, cx),
             },
             SlashAction::Custom(command) => self.run_custom_command(command, query, window, cx),
         }
@@ -1790,6 +1925,11 @@ impl InkdownApp {
                     PopupMenuItem::new("AI 排版…")
                         .icon(IconName::WandSparkles)
                         .action(Box::new(AiFormat)),
+                )
+                .item(
+                    PopupMenuItem::new("校验代码…")
+                        .icon(IconName::Bug)
+                        .action(Box::new(CheckCode)),
                 )
             })
     }
@@ -3639,8 +3779,8 @@ impl InkdownApp {
                 .map(str::to_string)
                 .unwrap_or_else(|| current.clone())
         };
-        let mut languages = doc::CODE_LANGUAGES.to_vec();
-        languages.sort_by(|(_, left), (_, right)| left.cmp(right));
+        let query = self.code_lang_query.read(cx).value().to_string();
+        let languages = doc::filter_languages(&query);
         let rows = languages
             .chunks(3)
             .map(|chunk| {
@@ -3681,6 +3821,7 @@ impl InkdownApp {
                     .bg(cx.theme().popover)
                     .overflow_hidden()
                     .occlude()
+                    .on_action(cx.listener(Self::on_code_lang_enter))
                     .child(
                         h_flex()
                             .h(px(58.))
@@ -3716,6 +3857,21 @@ impl InkdownApp {
                             ),
                     )
                     .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .px_5()
+                            .pt_3()
+                            .pb_1()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Icon::new(IconName::Search)
+                                    .xsmall()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(Input::new(&self.code_lang_query).flex_1().small()),
+                    )
+                    .child(
                         v_flex()
                             // Per-fence id: reopening for another block starts
                             // its list from the top again.
@@ -3728,7 +3884,18 @@ impl InkdownApp {
                             .overflow_y_scroll()
                             .p_4()
                             .gap_2()
-                            .children(rows),
+                            .children(rows)
+                            .when(languages.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .py_6()
+                                        .text_center()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("没有匹配的语言"),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()
@@ -3744,7 +3911,7 @@ impl InkdownApp {
                                     .flex_1()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("列表中的语言都带语法高亮，也可以直接在围栏上手写"),
+                                    .child("输入即过滤 · Enter 选第一个 · 也可直接在围栏上手写"),
                             )
                             .child(
                                 Button::new("code-lang-plain")
@@ -4873,6 +5040,348 @@ impl InkdownApp {
         .into_any_element()
     }
 
+    // ---- code check (local model) -----------------------------------------
+
+    /// Gates the checker and opens its modal; runs a check when none is
+    /// cached yet so a reopen after fixing things shows the last results
+    /// until 重新校验 is pressed.
+    fn open_validate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.slash = None;
+        let Some(app_config) = cx.try_global::<config::AppConfig>() else {
+            return;
+        };
+        let code_check = app_config.code_check.clone();
+        if !code_check.enabled {
+            self.notice = Some("先在 设置 → 代码校验 里启用本功能".to_string());
+            cx.notify();
+            return;
+        }
+        match code_check.mode {
+            config::CheckMode::Local => {
+                let entry = validate::model_by_id(&code_check.local_model);
+                if !validate::is_downloaded(entry.id) {
+                    self.notice = Some(format!("模型「{}」还没有下载，已打开设置", entry.display));
+                    self.open_settings(window, cx);
+                    return;
+                }
+                // Say exactly which model runs — nothing is a black box.
+                self.validate_model_label = format!("{} · {}（本地）", entry.display, entry.quant);
+            }
+            config::CheckMode::Api => {
+                let ai = app_config.ai.clone();
+                if ai.base_url.trim().is_empty()
+                    || ai.api_key.trim().is_empty()
+                    || ai.model.trim().is_empty()
+                {
+                    self.notice = Some("AI 接口未配置，请到 设置 → AI 写作 填写".to_string());
+                    self.open_settings(window, cx);
+                    return;
+                }
+                self.validate_model_label = format!("AI 接口 · {}", ai.model);
+            }
+        }
+        self.validate_open = true;
+        cx.notify();
+        // Rerun when there is nothing to show yet, or when the engine changed
+        // since the last run — stale issues must never sit under a new label.
+        if !self.validate_busy
+            && (self.validate_issues.is_empty()
+                || self.validate_ran_label != self.validate_model_label)
+        {
+            self.start_check(window, cx);
+        }
+    }
+
+    /// Runs one pass over the document's fenced blocks through the mode the
+    /// settings selected (local model or the configured AI endpoint).
+    fn start_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.validate_busy {
+            return;
+        }
+        let source = self.editor.read(cx).value().to_string();
+        let blocks = doc::code_blocks(&source);
+        if blocks.iter().all(|block| block.code.trim().is_empty()) {
+            self.validate_error = Some("文档里没有可校验的代码块".to_string());
+            cx.notify();
+            return;
+        }
+        let code_check = cx.global::<config::AppConfig>().code_check.clone();
+        let ai = cx.global::<config::AppConfig>().ai.clone();
+        self.validate_busy = true;
+        self.validate_error = None;
+        self.validate_issues.clear();
+        self.validate_checked = 0;
+        // Record which engine these results will belong to.
+        self.validate_ran_label = self.validate_model_label.clone();
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let target = match code_check.mode {
+                        config::CheckMode::Local => validate::CheckTarget::Local {
+                            model_id: &code_check.local_model,
+                        },
+                        config::CheckMode::Api => validate::CheckTarget::Api { config: &ai },
+                    };
+                    validate::check_document(&target, &blocks)
+                })
+                .await;
+            this.update_in(cx, |this, _window, cx| {
+                this.validate_busy = false;
+                match result {
+                    Ok((checked, issues)) => {
+                        this.validate_checked = checked;
+                        this.validate_issues = issues;
+                    }
+                    Err(error) => this.validate_error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Jump the editor to the fence an issue belongs to, closing the modal so
+    /// the target line is actually visible.
+    fn select_validate_issue(
+        &mut self,
+        fence_start: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.validate_open = false;
+        self.jump_to(fence_start, String::new(), window, cx);
+    }
+
+    fn validate_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        // The label names the engine that runs (or will run) this check.
+        let label = self.validate_model_label.clone();
+        let with_label = |what: String| {
+            if label.is_empty() {
+                what
+            } else {
+                format!("使用 {label} · {what}")
+            }
+        };
+        let summary = if self.validate_busy {
+            with_label("校验中…".to_string())
+        } else if let Some(error) = &self.validate_error {
+            error.clone()
+        } else if self.validate_checked == 0 {
+            "还没有运行过校验".to_string()
+        } else if self.validate_issues.is_empty() {
+            with_label(format!(
+                "已校验 {} 个代码块，没有发现明显问题",
+                self.validate_checked
+            ))
+        } else {
+            with_label(format!(
+                "已校验 {} 个代码块 · 发现 {} 个问题",
+                self.validate_checked,
+                self.validate_issues.len()
+            ))
+        };
+        let rows = self
+            .validate_issues
+            .iter()
+            .enumerate()
+            .map(|(index, issue)| {
+                let fence_start = issue.fence_start;
+                let line = issue.line;
+                let message = issue.message.clone();
+                let lang = if issue.lang.is_empty() {
+                    "纯文本".to_string()
+                } else {
+                    doc::code_language_display(&issue.lang)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| issue.lang.clone())
+                };
+                h_flex()
+                    .id(SharedString::from(format!("validate-row-{index}")))
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_3()
+                    .rounded_md()
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|style| style.bg(cx.theme().muted))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_validate_issue(fence_start, window, cx);
+                    }))
+                    .child(
+                        Icon::new(IconName::TriangleAlert)
+                            .xsmall()
+                            .text_color(cx.theme().danger),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_baseline()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .child(format!("第 {line} 行")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(lang),
+                                    ),
+                            )
+                            .child(div().text_sm().child(message)),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .xsmall()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        self.modal_shell("validate-overlay", cx)
+            .child(
+                v_flex()
+                    .w(px(640.))
+                    .h(relative(0.8))
+                    .max_h(px(620.))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .overflow_hidden()
+                    .occlude()
+                    .child(
+                        h_flex()
+                            .h(px(58.))
+                            .flex_shrink_0()
+                            .px_5()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                v_flex()
+                                    .gap_0()
+                                    .child(div().text_base().font_semibold().child("代码校验"))
+                                    .child(
+                                        div()
+                                            .max_w(px(480.))
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(summary),
+                                    ),
+                            )
+                            .child(
+                                Button::new("validate-close")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::X)
+                                    .disabled(self.validate_busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.validate_open = false;
+                                        this.focus_editor(window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .id("validate-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p_4()
+                            .gap_1()
+                            .when(self.validate_busy, |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("本地模型加载与推理中，首次运行会多花几秒…"),
+                                )
+                            })
+                            .when(
+                                !self.validate_busy
+                                    && self.validate_error.is_none()
+                                    && self.validate_issues.is_empty()
+                                    && self.validate_checked > 0,
+                                |this| {
+                                    this.child(
+                                        v_flex()
+                                            .w_full()
+                                            .py_6()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                Icon::new(IconName::CircleCheck)
+                                                    .with_size(px(22.))
+                                                    .text_color(cx.theme().muted_foreground),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child("没有发现明显问题"),
+                                            ),
+                                    )
+                                },
+                            )
+                            .children(rows),
+                    )
+                    .child(
+                        h_flex()
+                            .h(px(58.))
+                            .flex_shrink_0()
+                            .px_5()
+                            .gap_2()
+                            .items_center()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("点问题行跳到对应代码块 · 结果基于校验时的文档"),
+                            )
+                            .child(
+                                Button::new("validate-again")
+                                    .outline()
+                                    .xsmall()
+                                    .label("重新校验")
+                                    .disabled(self.validate_busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.start_check(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("validate-done")
+                                    .primary()
+                                    .xsmall()
+                                    .label("完成")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.validate_open = false;
+                                        this.focus_editor(window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn ai_modal(&self, cx: &mut Context<Self>) -> AnyElement {
         let model = self.settings.ai_model.read(cx).value().to_string();
         let configured = cx
@@ -5123,6 +5632,20 @@ impl InkdownApp {
         self.settings = SettingsForm::new(window, cx, &config);
         self.settings_watch = Self::watch_settings(&self.settings, cx);
         self.settings_open = true;
+        // Probe hardware once so the code-check section can show the machine
+        // and its recommendation instead of guessing.
+        if !self.hardware_started {
+            self.hardware_started = true;
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .spawn(async move {
+                        validate::detect_hardware();
+                    })
+                    .await;
+                this.update(cx, |_, cx| cx.notify()).ok();
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -5134,6 +5657,9 @@ impl InkdownApp {
         let mut config = cx.global::<config::AppConfig>().clone();
         self.settings.apply(&mut config, cx)?;
         *cx.global_mut::<config::AppConfig>() = config.clone();
+        // The model folder can change per keystroke; keep the validator's
+        // path view in step with it so download status stays truthful.
+        validate::set_models_dir(Some(config.code_check.models_dir.clone().into()));
         config::save_to_disk(&config)
     }
 
@@ -5680,6 +6206,13 @@ impl InkdownApp {
             }
             return;
         }
+        if self.validate_open {
+            if !self.validate_busy {
+                self.validate_open = false;
+                cx.notify();
+            }
+            return;
+        }
         if self.meta_open {
             self.meta_open = false;
             cx.notify();
@@ -5714,6 +6247,10 @@ impl InkdownApp {
 
     fn on_ai_format(&mut self, _: &AiFormat, window: &mut Window, cx: &mut Context<Self>) {
         self.open_format(window, cx);
+    }
+
+    fn on_check_code(&mut self, _: &CheckCode, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_validate(window, cx);
     }
 
     fn on_open_history(&mut self, _: &OpenHistory, window: &mut Window, cx: &mut Context<Self>) {
@@ -5777,6 +6314,10 @@ impl InkdownApp {
 
     fn settings_modal(&self, cx: &mut Context<Self>) -> AnyElement {
         let kind = self.settings.image_kind;
+        // One snapshot per frame: the probe may finish while the dialog is
+        // open, and closures below must not re-read a lock mid-render.
+        let check_hardware = validate::hardware();
+        let check_api_model = cx.global::<config::AppConfig>().ai.model.trim().to_string();
 
         self.modal_shell("settings-overlay", cx).child(
             v_flex()
@@ -6233,6 +6774,171 @@ impl InkdownApp {
                                 )),
                         )
                         .child(
+                            v_flex()
+                                .gap_3()
+                                .p_4()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(self.section_header(
+                                    "代码校验",
+                                    "用模型检查代码块的明显错误：本地离线模型或设置里的 AI 接口；默认关闭，只在手动触发时运行。",
+                                    cx,
+                                ))
+                                .child(self.toggle_row(
+                                    "check-enabled",
+                                    "启用代码校验",
+                                    "入口：格式菜单 → 校验代码，或编辑器输入 /校验",
+                                    self.settings.check_enabled,
+                                    true,
+                                    cx,
+                                    |this| {
+                                        this.settings.check_enabled = !this.settings.check_enabled;
+                                    },
+                                ))
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .child("校验方式"),
+                                        )
+                                        .child(div().flex_1())
+                                        .child(self.check_mode_button(
+                                            "本地模型（离线）",
+                                            config::CheckMode::Local,
+                                            cx,
+                                        ))
+                                        .child(self.check_mode_button(
+                                            "AI 大模型（接口）",
+                                            config::CheckMode::Api,
+                                            cx,
+                                        )),
+                                )
+                                .when(
+                                    self.settings.check_mode == config::CheckMode::Local,
+                                    |this| {
+                                        this.child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(
+                                                    h_flex()
+                                                        .gap_2()
+                                                        .items_baseline()
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .font_semibold()
+                                                                .child("本机与推荐"),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(cx.theme().muted_foreground)
+                                                                .child("检测 CPU / 内存 / 显卡与可用推理后端"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(
+                                                            check_hardware
+                                                                .as_ref()
+                                                                .map(describe_hardware)
+                                                                .unwrap_or_else(|| {
+                                                                    "检测中…（首次约 1–2 秒）"
+                                                                        .to_string()
+                                                                }),
+                                                        ),
+                                                )
+                                                .when(check_hardware.is_some(), |this| {
+                                                    let hardware = check_hardware.as_ref().unwrap();
+                                                    let entry = validate::recommend(hardware);
+                                                    this.child(
+                                                        h_flex()
+                                                            .gap_2()
+                                                            .items_baseline()
+                                                            .child(
+                                                                div()
+                                                                    .px_2()
+                                                                    .rounded_md()
+                                                                    .bg(cx.theme().primary)
+                                                                    .text_xs()
+                                                                    .text_color(
+                                                                        cx.theme()
+                                                                            .primary_foreground,
+                                                                    )
+                                                                    .child("推荐"),
+                                                            )
+                                                            .child(
+                                                                div().text_xs().child(format!(
+                                                                    "{} · {} · {} — {}",
+                                                                    entry.display,
+                                                                    entry.size_hint,
+                                                                    entry.ram_hint,
+                                                                    entry.note
+                                                                )),
+                                                            ),
+                                                    )
+                                                })
+                                                .child(self.settings_field(
+                                                    "模型目录",
+                                                    "留空使用默认 data/models，改动即时生效",
+                                                    &self.settings.check_models_dir,
+                                                    cx,
+                                                ))
+                                                .child(
+                                                    h_flex().gap_1().child(self.check_source_button(
+                                                        "魔搭（国内）",
+                                                        config::CheckSource::ModelScope,
+                                                        cx,
+                                                    )).child(self.check_source_button(
+                                                        "HuggingFace（国外）",
+                                                        config::CheckSource::HuggingFace,
+                                                        cx,
+                                                    )).child(self.check_source_button(
+                                                        "hf-mirror（国内）",
+                                                        config::CheckSource::HfMirror,
+                                                        cx,
+                                                    )),
+                                                )
+                                                .child(
+                                                    v_flex().gap_2().children(
+                                                        validate::MODELS
+                                                            .iter()
+                                                            .map(|entry| {
+                                                                self.model_row(entry, cx)
+                                                            })
+                                                            .collect::<Vec<_>>(),
+                                                    ),
+                                                ),
+                                        )
+                                    },
+                                )
+                                .when(
+                                    self.settings.check_mode == config::CheckMode::Api,
+                                    |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(if check_api_model.is_empty() {
+                                                    "使用「设置 → AI 写作」的接口与模型（当前未配置）"
+                                                        .to_string()
+                                                } else {
+                                                    format!(
+                                                        "使用「设置 → AI 写作」的接口与模型，当前：{check_api_model}"
+                                                    )
+                                                }),
+                                        )
+                                    },
+                                ),
+                        )
+                        .child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
@@ -6365,6 +7071,222 @@ impl InkdownApp {
                 this.flush_settings(cx).ok();
                 cx.notify();
             }))
+    }
+
+    fn check_source_button(
+        &self,
+        label: &'static str,
+        source: config::CheckSource,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        Button::new(label)
+            .ghost()
+            .xsmall()
+            .label(label)
+            .selected(self.settings.check_source == source)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.settings.check_source = source;
+                this.flush_settings(cx).ok();
+                cx.notify();
+            }))
+    }
+
+    fn check_mode_button(
+        &self,
+        label: &'static str,
+        mode: config::CheckMode,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        Button::new(label)
+            .ghost()
+            .xsmall()
+            .label(label)
+            .selected(self.settings.check_mode == mode)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.settings.check_mode = mode;
+                this.flush_settings(cx).ok();
+                cx.notify();
+            }))
+    }
+
+    /// One row of the model catalog: identity on top, state and the download
+    /// button below. Clicking the row selects the model for local checks.
+    fn model_row(
+        &self,
+        entry: &'static validate::ModelEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.settings.check_local_model == entry.id;
+        let downloaded = validate::is_downloaded(entry.id);
+        let busy = self.settings.busy.is_some() || self.downloading;
+        let recommended = validate::hardware()
+            .as_ref()
+            .is_some_and(|hardware| validate::recommend(hardware).id == entry.id);
+        v_flex()
+            .id(SharedString::from(format!("model-row-{}", entry.id)))
+            .w_full()
+            .gap_2()
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(if selected {
+                cx.theme().primary
+            } else {
+                cx.theme().border
+            })
+            .cursor(CursorStyle::PointingHand)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.settings.check_local_model = entry.id.to_string();
+                this.flush_settings(cx).ok();
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_baseline()
+                    .child(div().text_sm().font_semibold().child(entry.display))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{} · {}", entry.quant, entry.size_hint)),
+                    )
+                    .when(recommended, |this| {
+                        this.child(
+                            div()
+                                .px_2()
+                                .rounded_md()
+                                .bg(cx.theme().primary)
+                                .text_xs()
+                                .text_color(cx.theme().primary_foreground)
+                                .child("推荐"),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .when(selected, |this| {
+                        this.child(
+                            Icon::new(IconName::Check)
+                                .xsmall()
+                                .text_color(cx.theme().primary),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(format!("{} · {}", entry.note, entry.ram_hint)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if downloaded { "已下载" } else { "未下载" }),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("model-dl-{}", entry.id)))
+                            .outline()
+                            .xsmall()
+                            .label(if downloaded {
+                                "重新下载"
+                            } else {
+                                "下载模型"
+                            })
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.download_check_model(entry, window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Streams the checker model from the selected mirror with a polled
+    /// progress line in the settings footer (busy text is all the dialog has).
+    /// Streams one catalog model from the selected mirror with a polled
+    /// progress line in the settings footer; success selects it for checks.
+    fn download_check_model(
+        &mut self,
+        entry: &'static validate::ModelEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.busy.is_some() || self.downloading {
+            return;
+        }
+        let source = self.settings.check_source;
+        let progress = validate::DownloadProgress::default();
+        self.downloading = true;
+        self.settings.busy = Some(format!("正在下载 {} 0%…", entry.display));
+        self.settings.notice = None;
+        cx.notify();
+
+        // Refresh the busy line while the download streams on the background
+        // executor; exits as soon as the download task clears the flag.
+        let poll = progress.clone();
+        let polled_name = entry.display;
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+                let alive = this
+                    .update_in(cx, |this, _window, cx| {
+                        if !this.downloading {
+                            return false;
+                        }
+                        this.settings.busy =
+                            Some(format!("正在下载 {polled_name} {}%", poll.percent()));
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { validate::download(entry, source, &progress) })
+                .await;
+            this.update_in(cx, |this, _window, cx| {
+                this.downloading = false;
+                this.settings.busy = None;
+                match result {
+                    Ok(path) => {
+                        let megabytes = std::fs::metadata(&path)
+                            .map(|meta| meta.len() / (1024 * 1024))
+                            .unwrap_or(0);
+                        // Downloading means using: select what just arrived.
+                        this.settings.check_local_model = entry.id.to_string();
+                        this.flush_settings(cx).ok();
+                        this.settings.notice = Some(format!(
+                            "{}（{}）已就绪（{megabytes} MB），已设为校验模型",
+                            entry.display, entry.quant
+                        ));
+                    }
+                    Err(error) => {
+                        this.settings.notice = Some(format!("{} 下载失败：{error}", entry.display));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_row<F>(
@@ -7595,15 +8517,36 @@ impl InkdownApp {
                                         .map(|lang| lang.to_string())
                                         .unwrap_or_default();
                                     let fence = block.span.map(|span| span.start);
-                                    let label = if current.is_empty() {
+                                    let handle = code_lang_handle.clone();
+                                    // Findings from the last run, keyed by
+                                    // this block's fence offset.
+                                    let issues = fence
+                                        .map(|fence| {
+                                            handle
+                                                .read_with(cx, |this, _| {
+                                                    this.validate_issues
+                                                        .iter()
+                                                        .filter(|issue| issue.fence_start == fence)
+                                                        .count()
+                                                })
+                                                .unwrap_or(0)
+                                        })
+                                        .unwrap_or(0);
+                                    let mut label = if current.is_empty() {
                                         "语言".to_string()
                                     } else {
                                         doc::code_language_display(&current)
                                             .map(str::to_string)
                                             .unwrap_or_else(|| current.clone())
                                     };
-                                    let handle = code_lang_handle.clone();
-                                    let muted = cx.theme().muted_foreground;
+                                    if issues > 0 {
+                                        label = format!("⚠ {label} · {issues}");
+                                    }
+                                    let muted = if issues > 0 {
+                                        cx.theme().danger
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    };
                                     let hovered = cx.theme().foreground;
                                     div()
                                         .id("code-lang-chip")
@@ -7619,12 +8562,17 @@ impl InkdownApp {
                                         .cursor_pointer()
                                         .hover(move |style| style.text_color(hovered))
                                         .child(label)
-                                        .on_click(move |_, _, cx| {
+                                        .on_click(move |_, window, cx| {
                                             let Some(fence) = fence else {
                                                 return;
                                             };
                                             let _ = handle.update(cx, |this, cx| {
-                                                this.open_code_lang(fence, current.clone(), cx)
+                                                this.open_code_lang(
+                                                    fence,
+                                                    current.clone(),
+                                                    window,
+                                                    cx,
+                                                )
                                             });
                                         })
                                 })
@@ -7985,6 +8933,9 @@ impl Render for InkdownApp {
             .when(self.chat_open, |this| this.child(self.chat_modal(cx)))
             .when(self.format_open, |this| this.child(self.format_modal(cx)))
             .when(self.history_open, |this| this.child(self.history_modal(cx)))
+            .when(self.validate_open, |this| {
+                this.child(self.validate_modal(cx))
+            })
             .when(self.close_confirm.is_some(), |this| {
                 this.child(self.close_confirm_modal(cx))
             })
@@ -8016,6 +8967,7 @@ impl Render for InkdownApp {
             .on_action(cx.listener(Self::on_publish_action))
             .on_action(cx.listener(Self::on_ai_write))
             .on_action(cx.listener(Self::on_ai_format))
+            .on_action(cx.listener(Self::on_check_code))
             .on_action(cx.listener(Self::on_open_history))
             .on_action(cx.listener(Self::on_open_settings_action))
             .on_action(cx.listener(Self::on_backup_action))

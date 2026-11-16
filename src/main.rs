@@ -12,11 +12,13 @@ mod commands;
 mod config;
 mod doc;
 mod git;
+mod highlight;
 mod history;
 mod imagebed;
 mod publish;
 mod theme;
 mod ui;
+mod validate;
 mod widgets;
 mod workspace;
 

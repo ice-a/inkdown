@@ -4,6 +4,7 @@
 //! ivory in the light, lamp-lit charcoal in the dark, with a seal-red accent
 //! used sparingly for carets, links and the mark.
 
+use gpui_kit::base::text::TextViewDefaults;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
@@ -26,6 +27,14 @@ pub fn apply(cx: &mut App) {
             apply_light(theme);
         }
     });
+    // Theme::update re-installs the stock text-view defaults, so ours goes
+    // back on top of every palette (re)apply: startup and mode switches both
+    // land here, which keeps the code-block highlighter on the fresh theme.
+    TextViewDefaults::global(cx)
+        .with_code_block_highlighter(crate::highlight::block_highlighter(
+            Theme::global(cx).highlight_theme.clone(),
+        ))
+        .install(cx);
 }
 
 /// Switch light/dark and re-apply the palette on top of the new config.

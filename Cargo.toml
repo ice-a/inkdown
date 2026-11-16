@@ -1,6 +1,6 @@
 [package]
 name = "inkdown"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Inkdown - a beautifully crafted Markdown editor built with GPUI Kit"
 authors = ["ice-a"]
@@ -17,6 +17,16 @@ zip = { version = "2.4", default-features = false, features = ["deflate"] }
 dirs = "6"
 chrono = { version = "0.4", features = ["clock"] }
 image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
+# Same grammar set and versions gpui-kit already uses. Feature flags must
+# mirror kit's (fancy regex, no default features) or unification would pull
+# the onig C backend into the build.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
+# Local inference for the optional code checker (llama.cpp bindings).
+# Default features enable OpenMP: it needs libomp on macOS (breaks the build
+# and would ship a binary users cannot launch) and pulls VCOMP140.DLL into
+# the Windows exe, which stock systems do not have — keep it off everywhere.
+llama-cpp-2 = { version = "0.1.161", default-features = false, features = ["common"] }
 
 [features]
 default = []

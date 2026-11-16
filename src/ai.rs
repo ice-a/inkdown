@@ -239,6 +239,11 @@ pub fn chat(config: &AiConfig, system: &str, turns: &[ChatTurn]) -> Result<Strin
 /// document's wording, order and meaning must survive untouched.
 pub const FORMAT_SYSTEM_PROMPT: &str = "你是 Markdown 排版助手。只调整排版，不改动任何文字内容、不增删段落、不改写语义。要求：统一标题层级（一级到三级依次使用 #、##、###，不跳级）；列表项缩进与符号统一（无序用 -，有序用 1. 2. 3.）；表格列对齐并补全管道符；代码块保留围栏并标注语言；段落之间保留一个空行；中英文之间、数字与中文之间加一个空格；修正明显的中英文标点混用。直接输出排版后的完整 Markdown 正文，不要用代码围栏包裹，不要输出任何解释。";
 
+/// System prompt for checking one code block through an AI endpoint. Unlike
+/// the local model's prefilled path, an API model writes the whole answer, so
+/// the prompt owns the output contract.
+pub const CHECK_SYSTEM_PROMPT: &str = "你是代码审查器，只检查给定代码的具体错误：语法错误（括号或引号不配对、缺失冒号）、未定义的名字、明显的类型错误。忽略风格与命名。只输出 JSON（可以用 ```json 围栏包裹）：{\"issues\":[{\"line\":<代码内 1 起的行号>,\"message\":\"<一句话>\"}]}；代码没有问题就输出 {\"issues\":[]}。拿不准时输出空列表。";
+
 /// POST {base}/chat/completions — typeset one whole document.
 ///
 /// The full text goes out untruncated: dropping content in a formatting pass

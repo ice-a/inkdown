@@ -6,8 +6,8 @@ use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::*;
 
 use crate::config::{
-    AiConfig, AppConfig, CnblogsConfig, GitConfig, ImageHostConfig, ImageHostKind, StartupMode,
-    WechatConfig,
+    AiConfig, AppConfig, CheckMode, CheckSource, CnblogsConfig, GitConfig, ImageHostConfig,
+    ImageHostKind, StartupMode, WechatConfig,
 };
 use crate::publish::Targets;
 
@@ -67,6 +67,13 @@ pub struct SettingsForm {
     pub history_enabled: bool,
     /// Minutes between history snapshots, as text so the field watches edits.
     pub history_interval: Entity<InputState>,
+
+    pub check_enabled: bool,
+    pub check_source: CheckSource,
+    pub check_mode: CheckMode,
+    /// Selected catalog id; paired with the rendered list in settings.
+    pub check_local_model: String,
+    pub check_models_dir: Entity<InputState>,
 
     pub notice: Option<String>,
     pub busy: Option<String>,
@@ -175,6 +182,17 @@ impl SettingsForm {
                 config.startup_document.as_deref().unwrap_or(""),
             ),
             history_enabled: config.history.enabled,
+            check_enabled: config.code_check.enabled,
+            check_source: config.code_check.source,
+            check_mode: config.code_check.mode,
+            check_local_model: config.code_check.local_model.clone(),
+            check_models_dir: input(
+                window,
+                cx,
+                "留空使用默认 data/models",
+                false,
+                &config.code_check.models_dir,
+            ),
             history_interval: input(
                 window,
                 cx,
@@ -210,6 +228,7 @@ impl SettingsForm {
             self.backup_dir.clone(),
             self.startup_document.clone(),
             self.history_interval.clone(),
+            self.check_models_dir.clone(),
         ]
     }
 
@@ -229,6 +248,11 @@ impl SettingsForm {
             Some(startup_document)
         };
         config.history.enabled = self.history_enabled;
+        config.code_check.enabled = self.check_enabled;
+        config.code_check.source = self.check_source;
+        config.code_check.mode = self.check_mode;
+        config.code_check.local_model = self.check_local_model.clone();
+        config.code_check.models_dir = self.check_models_dir.read(cx).value().trim().to_string();
         config.history.interval_minutes = self
             .history_interval
             .read(cx)

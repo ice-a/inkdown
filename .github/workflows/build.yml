@@ -45,7 +45,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            gcc g++ clang libfontconfig-dev libwayland-dev \
+            gcc g++ clang libclang-dev libfontconfig-dev libwayland-dev \
             libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev \
             libssl-dev libzstd-dev libasound2-dev \
             vulkan-validationlayers libvulkan1
@@ -56,6 +56,27 @@ jobs:
 
       # Replaces the system ld on Linux; a no-op elsewhere.
       - uses: rui314/setup-mold@v1
+
+      # llama-cpp-sys generates FFI bindings with bindgen, which loads
+      # libclang.dll. Windows runners usually ship LLVM but do not export
+      # LIBCLANG_PATH; install it ourselves when the image has none.
+      - name: Point bindgen at libclang (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          found=""
+          for dir in "/c/Program Files/LLVM/bin" "/c/Program Files/LLVM/lib"; do
+            if compgen -G "$dir/libclang.dll" > /dev/null; then
+              found="$(cygpath -w "$dir")"
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "LLVM not preinstalled, installing via chocolatey"
+            choco install llvm --no-progress -y
+            found="C:\\Program Files\\LLVM\\bin"
+          fi
+          echo "LIBCLANG_PATH=$found" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$found"
 
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}

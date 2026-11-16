@@ -50,7 +50,17 @@
 
 - 围栏代码块按语言着色，内置约 200 种语法定义；
 - 每个代码块右上角有语言按钮，可切换 60+ 种常用语言；选中后直接改写围栏，预览立刻生效；
-- `/代码块` 插入围栏后直接打开语言列表。
+- **语言弹层可搜索**：输入即过滤（token / 中英文名 / 别名都能命中，`golang` 找到 Go），
+  `Enter` 选中第一个结果；`/代码块`、格式菜单插入后都会直接打开它；
+- 手写别名同样生效：` ```golang `、` ```shell `、` ```node ` 等按目标语言高亮并显示规范名；
+- **代码校验（默认关闭）**：双通道检查代码块的明显错误——
+  **本地模型**（离线）：模型目录收录三档 Qwen2.5-Coder Q4_K_M（0.5B / 1.5B / 3B，
+  380MB–1.9GB），下载源可选魔搭 / HuggingFace / hf-mirror（国内国外皆可），模型目录可自定义；
+  **AI 大模型**：直接用「设置 → AI 写作」里配置的接口与模型。
+  设置会检测本机 CPU / 内存 / 显卡与可用推理后端并推荐合适档位（当前构建以 CPU 推理，
+  如实标注）；用哪个模型、什么量化、什么后端全部明示，绝不黑盒。
+  格式菜单「校验代码」或 `/校验` 触发，弹窗列出问题（标注所用模型）、点击跳转到对应代码块，
+  预览里的代码块角标会标出问题数量。
 
 <img src="docs/screenshot-language.png" width="720" alt="代码块语言选择" />
 
@@ -146,6 +156,8 @@ sudo apt install ./Inkdown-*-linux-x86_64.deb
 
 - 文稿、备份、配置都在你自己的磁盘上，Inkdown 不上传、不收集；
 - 历史版本保存在数据目录的本地 Git 仓库里，纯离线，不会推送到任何远端；
+- 代码校验默认走本地：模型文件存放在模型目录（默认数据目录的 `models/`，可在设置里改），
+  推理完全本地进行；选用「AI 大模型」通道时才会把代码发给你自己配置的接口；
 - AppID / Token 等密钥以**明文**保存在本机 `config.json`，请勿把该文件提交到公开仓库；
 - 自定义命令以当前用户权限运行，可以访问文件和网络，只运行你信任的脚本。
 
@@ -179,7 +191,9 @@ cargo run
 cargo build --release
 ```
 
-要求 Rust **1.92+**（MSVC toolchain）、Visual Studio 2022 Build Tools（C++ 桌面开发）和 CMake。
+要求 Rust **1.92+**（MSVC toolchain）、Visual Studio 2022 Build Tools（C++ 桌面开发）、
+CMake 和 **libclang**（llama.cpp 绑定生成 FFI 用：Windows 装 LLVM，Linux 装 `libclang-dev`，
+macOS 用 Xcode Command Line Tools）。
 Windows 的 debug / release 都是 GUI 子系统，双击不会弹 cmd 窗口；需要终端输出时用
 `cargo run --features console` 构建控制台版本。
 
