@@ -222,3 +222,7 @@ zip 备份、Git 初始化 / 提交 / 推送到本地裸仓库、启动行为选
 ## 参与贡献
 
 Issue 和 PR 都欢迎。改动前请先开 issue 说明场景，提交前跑一遍 `cargo fmt` 和 `cargo test`。
+
+## 友链
+
+- [linux.do](https://linux.do/t/topic/256529) — 开发者社区
