@@ -222,15 +222,13 @@
   .shots-bleed .shot {
     display: block; width: 100%; max-width: 1360px; margin: 0 auto;
   }
-  .duo-3 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 18px; }
   figure { margin: 0; }
   figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; text-align: center; }
   .shot {
     width: 100%; display: block; border-radius: 12px; border: 1px solid var(--line);
     box-shadow: var(--shadow); background: var(--panel);
   }
-  .shot-wide { max-width: 860px; margin: 18px auto 0; }
-  @media (max-width: 720px) { .duo-3 { grid-template-columns: 1fr; } }
+  
 
   /* ---------- features ---------- */
   .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
@@ -358,20 +356,8 @@
         <img class="shot" src="screenshot-dark.png" alt="墨夜主题：左侧源码，右侧实时预览" loading="lazy" width="1360" height="860">
         <figcaption>墨夜 · 写作分栏</figcaption>
       </figure>
-    </div>
-    <div class="wrap">
-      <div class="duo-3">
-        <figure>
-          <img class="shot" src="screenshot-language.png" alt="代码块语言选择弹层" loading="lazy" width="656" height="590">
-          <figcaption>代码块语言 · 可搜索弹层</figcaption>
-        </figure>
-        <figure>
-          <img class="shot" src="screenshot-chat.png" alt="询问 AI 对话窗口" loading="lazy" width="664" height="696">
-          <figcaption>询问 AI · 多轮对话</figcaption>
-        </figure>
-      </div>
       <figure>
-        <img class="shot shot-wide" src="screenshot-ai.png" alt="AI 一键排版预览" loading="lazy" width="1210" height="830">
+        <img class="shot" src="screenshot-ai.png" alt="AI 一键排版预览" loading="lazy" width="1210" height="830" style="max-width:1210px">
         <figcaption>AI 一键排版 · 先预览，确认才替换</figcaption>
       </figure>
     </div>
@@ -379,7 +365,7 @@
 
   <div class="wrap">
 
-  <section id="features">
+<section id="features">
     <div class="kicker">Features</div>
     <h2>它能做什么</h2>
     <p class="sub">为长文准备的写作流水线，不是一个单纯的预览器。</p>
