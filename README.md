@@ -225,4 +225,4 @@ Issue 和 PR 都欢迎。改动前请先开 issue 说明场景，提交前跑一
 
 ## 友链
 
-- [linux.do](https://linux.do/t/topic/256529) — 开发者社区
+- [linux.do](https://linux.do/t/topic/3189496) — 开发者社区
