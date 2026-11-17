@@ -9228,7 +9228,7 @@ impl InkdownApp {
             // 还是实时视图的，所以链两帧再分发，完成后切回实时。
             self.set_view(ViewMode::Write, window, cx);
             let app = cx.weak_entity();
-            window.on_next_frame(move |window, cx| {
+            window.on_next_frame(move |window, _cx| {
                 let app = app.clone();
                 window.on_next_frame(move |window, cx| {
                     let _ = app.update(cx, |this, cx| {
