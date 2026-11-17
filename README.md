@@ -14,6 +14,7 @@
 
 <p align="center">
   <a href="#下载">下载</a> ·
+  <a href="https://ice-a.github.io/inkdown/">介绍页</a> ·
   <a href="https://github.com/ice-a/inkdown/releases">Releases</a> ·
   <a href="https://github.com/ice-a/inkdown/issues">Issues</a>
 </p>
