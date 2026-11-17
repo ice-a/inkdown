@@ -15,6 +15,7 @@ mod git;
 mod highlight;
 mod history;
 mod imagebed;
+mod live;
 mod publish;
 mod theme;
 mod ui;
@@ -62,6 +63,15 @@ fn main() {
                 KeyBinding::new("ctrl-1", ViewWrite, None),
                 KeyBinding::new("ctrl-2", ViewSplit, None),
                 KeyBinding::new("ctrl-3", ViewPreview, None),
+                KeyBinding::new("ctrl-4", ViewLive, None),
+                // Esc ends a live-block edit; only bound while that editor's
+                // key context is on the focus chain, so other inputs are safe.
+                KeyBinding::new("escape", CloseOverlay, Some("LiveEdit")),
+                // 实时视图页面上的撤销/重做（块输入框聚焦时 Input 上下文
+                // 更深、会优先走会话内撤销）。
+                KeyBinding::new("ctrl-z", LiveUndo, Some("LiveView")),
+                KeyBinding::new("ctrl-shift-z", LiveRedo, Some("LiveView")),
+                KeyBinding::new("ctrl-y", LiveRedo, Some("LiveView")),
                 KeyBinding::new("escape", CloseOverlay, Some("Modal")),
             ]);
 

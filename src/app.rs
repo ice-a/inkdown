@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::text::editor_host::{BlockNode, FlowPosition, RenderContext};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, StyledExt as _,
     TitleBar,
@@ -32,8 +33,8 @@ use crate::doc::{self, Document, Heading, Stats};
 use crate::publish::upload_local_images;
 use crate::ui::{AiForm, PromptKind, PromptState, PublishForm, SettingsForm, SidebarTab};
 use crate::{
-    ai, backup, commands, config, git, history, imagebed, publish, theme, ui, validate, widgets,
-    workspace,
+    ai, backup, commands, config, git, history, imagebed, live, publish, theme, ui, validate,
+    widgets, workspace,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,23 @@ enum ViewMode {
     Write,
     Split,
     Preview,
+    /// 分块所见即所得：整页渲染成阅读态，点击任意块就地编辑其源码。
+    Live,
+}
+
+/// 实时模式里正在进行的块编辑。`virtual` 的槽位没有对应解析块——
+/// 智能 Enter 切出的新段落还没有源码（或为空），以零宽 span 挂在列表里。
+#[derive(Clone, PartialEq)]
+struct LiveEdit {
+    /// 列表槽位：编辑现有块时等于块下标；虚拟新块是插入位置。
+    slot: usize,
+    /// 块在主文档中的字节范围；虚拟编辑为 `pos..pos`。
+    span: Range<usize>,
+    /// 打开时的原文，值未变化时跳过提交。
+    original: String,
+    /// Enter 行为在打开时按块类型定死。
+    enter: live::EnterAction,
+    virtual_slot: bool,
 }
 
 pub struct InkdownApp {
@@ -51,6 +69,16 @@ pub struct InkdownApp {
     editor: Entity<EditorState>,
     preview: Entity<TextViewState>,
     view_mode: ViewMode,
+    /// 实时模式：解析出的顶层块树（Arc 免得每帧克隆），渲染闭包捕获快照。
+    live_blocks: std::sync::Arc<Vec<gpui_kit::base::text::editor_host::BlockNode>>,
+    /// 与预览一致的解析扩展（frontmatter 插件）。
+    live_exts: std::sync::Arc<MarkdownExtensions>,
+    live_list: ListState,
+    live_editing: Option<LiveEdit>,
+    /// 就地编辑当前块源码的输入框（自动增高）。
+    block_editor: Entity<TextareaState>,
+    /// 实时卡片的焦点落点：撤销后把焦点还给页面，避免落到隐藏的主编辑器。
+    live_focus: FocusHandle,
     sidebar_visible: bool,
     outline: Vec<Heading>,
     stats: Stats,
@@ -425,6 +453,15 @@ impl InkdownApp {
                 .placeholder("开始写下你的想法…")
         });
         let preview = cx.new(|cx| TextViewState::markdown(&first, cx));
+        let block_editor = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("输入 Markdown… Esc 或点击别处完成，Enter 切出新段落")
+                .soft_wrap(true)
+                .auto_grow(1, 60)
+                // 智能 Enter：切分类块按 Enter 提交；换行类块打开时改为 false。
+                .submit_on_enter(true)
+        });
+        let live_focus = cx.focus_handle();
         let preview_find = cx.new(|cx| InputState::new(window, cx).placeholder("在预览中查找"));
         let code_lang_query = cx.new(|cx| {
             InputState::new(window, cx)
@@ -482,6 +519,12 @@ impl InkdownApp {
             editor: editor.clone(),
             preview,
             view_mode: ViewMode::Split,
+            live_blocks: std::sync::Arc::new(Vec::new()),
+            live_exts: live::extensions(),
+            live_list: ListState::new(0, ListAlignment::Top, px(1000.)).measure_all(),
+            live_editing: None,
+            block_editor: block_editor.clone(),
+            live_focus,
             sidebar_visible: true,
             outline,
             stats,
@@ -564,6 +607,34 @@ impl InkdownApp {
         this._subscriptions.push(change_sub);
         this._subscriptions.push(cursor_sub);
         this._subscriptions.push(find_sub);
+        // 实时模式：块编辑一失焦就提交——点击别处、切走焦点都算“完成”。
+        // 订阅回调本身正持有 InkdownApp 的租约，绝不能在回调里再
+        // update_window 重入自己（双租约会 panic）：记下失焦的那次编辑，
+        // defer 到安全点再提交；期间若已切到别的块，这次过期失焦作废。
+        let live_handle = cx.weak_entity();
+        let block_blur = cx.subscribe(&block_editor, move |this, _, event: &InputEvent, cx| {
+            if !matches!(event, InputEvent::Blur) {
+                return;
+            }
+            let Some(pending) = this.live_editing.clone() else {
+                return;
+            };
+            let live_handle = live_handle.clone();
+            cx.defer(move |cx| {
+                let Some(window) = cx.active_window() else {
+                    return;
+                };
+                let live_handle = live_handle.clone();
+                let _ = cx.update_window(window, move |_, window, cx| {
+                    let _ = live_handle.update(cx, |this, cx| {
+                        if this.live_editing.as_ref() == Some(&pending) {
+                            this.live_commit(window, cx);
+                        }
+                    });
+                });
+            });
+        });
+        this._subscriptions.push(block_blur);
         // The picker filters from render state, so a Change only needs a pass.
         let lang_query_sub = cx.subscribe(&code_lang_query, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) && this.code_lang.is_some() {
@@ -757,6 +828,10 @@ impl InkdownApp {
             self.refresh_preview_find(false, cx);
         }
         self.update_slash_state(&previous, &value, cursor);
+        // 实时模式下主编辑器的任何变化（提交、撤销、整篇替换）都要重建块树。
+        if self.view_mode == ViewMode::Live {
+            self.live_reparse(cx);
+        }
         self.notice = None;
         cx.notify();
     }
@@ -776,6 +851,8 @@ impl InkdownApp {
             self.focus_editor(window, cx);
             return;
         }
+        // 换文档前把实时模式里没写完的块编辑落盘到旧文档。
+        self.live_commit(window, cx);
         self.slash = None;
         let current = self.editor.read(cx).value().to_string();
         if let Some(doc) = self.docs.get_mut(self.active) {
@@ -1066,14 +1143,34 @@ impl InkdownApp {
     }
 
     fn set_view(&mut self, mode: ViewMode, window: &mut Window, cx: &mut Context<Self>) {
+        // 切走实时模式前，把没写完的块编辑提交回源码。先落定新模式，
+        // 提交里“文档空了就放占位输入”的检查才不会在离开时误开编辑。
+        let leaving_live = self.view_mode == ViewMode::Live && mode != ViewMode::Live;
         self.view_mode = mode;
-        if mode != ViewMode::Preview {
+        if leaving_live {
+            self.live_commit(window, cx);
+        }
+        if mode == ViewMode::Live {
+            self.live_reparse(cx);
+            // 空文档直接落下占位输入，敲字即创建第一段。
+            if self.live_blocks.is_empty() && self.live_editing.is_none() {
+                self.live_open_virtual(0, 0, window, cx);
+            }
+        } else if matches!(mode, ViewMode::Write | ViewMode::Split) {
             self.focus_editor(window, cx);
         }
         cx.notify();
     }
 
     // ---- formatting -----------------------------------------------------
+
+    /// 直接改主编辑器的动作（加粗、标题、模板……）在实时模式下先落回
+    /// 写作视图：提交未完成的块编辑，并让改动位置可见。
+    fn ensure_editable(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_mode == ViewMode::Live {
+            self.set_view(ViewMode::Write, window, cx);
+        }
+    }
 
     fn wrap_selection(
         &mut self,
@@ -1083,6 +1180,7 @@ impl InkdownApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ensure_editable(window, cx);
         self.editor.update(cx, |state, cx| {
             let selected = state.selected_text().to_string();
             if selected.is_empty() {
@@ -1098,6 +1196,7 @@ impl InkdownApp {
     }
 
     fn code_block(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_editable(window, cx);
         // The opening fence lands wherever the edit starts: the caret for an
         // empty selection, the selection start otherwise.
         let fence = self.editor.read(cx).selected_range().start;
@@ -1181,6 +1280,7 @@ impl InkdownApp {
     }
 
     fn insert_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_editable(window, cx);
         self.editor.update(cx, |state, cx| {
             let selected = state.selected_text().to_string();
             let start = state.selected_range().start;
@@ -1197,6 +1297,7 @@ impl InkdownApp {
     }
 
     fn set_heading(&mut self, level: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_editable(window, cx);
         self.editor.update(cx, |state, cx| {
             let text = state.text().clone();
             let row = state.cursor_position().line as usize;
@@ -1225,6 +1326,7 @@ impl InkdownApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ensure_editable(window, cx);
         self.editor.update(cx, |state, cx| {
             let text = state.text().clone();
             let row = state.cursor_position().line as usize;
@@ -1256,6 +1358,7 @@ impl InkdownApp {
     }
 
     fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_editable(window, cx);
         self.editor
             .update(cx, |state, cx| state.insert(text.to_string(), window, cx));
         self.after_edit(window, cx);
@@ -1712,6 +1815,25 @@ impl InkdownApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 实时模式：渲染面不可放光标——滚动到包含该偏移的块即可，
+        // 焦点留在页面（而不是落进看不见的主编辑器）。
+        if self.view_mode == ViewMode::Live {
+            self.live_reparse(cx);
+            let slot = self
+                .live_blocks
+                .iter()
+                .position(|block| {
+                    block
+                        .span()
+                        .is_some_and(|span| span.start <= offset && offset <= span.end)
+                })
+                .unwrap_or(0);
+            self.live_list.scroll_to_reveal_item(slot);
+            let focus = self.live_focus.clone();
+            focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
         self.editor.update(cx, |state, cx| {
             let row = state.text().offset_to_point(offset).row;
             let line_height = state.line_height().unwrap_or(px(22.));
@@ -1815,25 +1937,23 @@ impl InkdownApp {
             })
     }
 
-    fn edit_menu(&self) -> impl IntoElement {
-        let undo_editor = self.editor.clone();
-        let redo_editor = self.editor.clone();
+    fn edit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let app = cx.weak_entity();
+        let undo_app = app.clone();
+        let redo_app = app.clone();
         self.menu_button("menu-edit", "编辑")
             .dropdown_menu(move |menu, _, _| {
-                let undo_editor = undo_editor.clone();
-                let redo_editor = redo_editor.clone();
+                let undo_app = undo_app.clone();
+                let redo_app = redo_app.clone();
                 menu.item(PopupMenuItem::new("撤销").icon(IconName::Undo).on_click(
                     move |_, window, cx| {
-                        let focus = undo_editor.read(cx).focus_handle(cx);
-                        focus.focus(window, cx);
-                        window.dispatch_action(Box::new(Undo), cx);
+                        let _ =
+                            undo_app.update(cx, |this, cx| this.undo_or_redo(false, window, cx));
                     },
                 ))
                 .item(PopupMenuItem::new("重做").icon(IconName::Redo).on_click(
                     move |_, window, cx| {
-                        let focus = redo_editor.read(cx).focus_handle(cx);
-                        focus.focus(window, cx);
-                        window.dispatch_action(Box::new(Redo), cx);
+                        let _ = redo_app.update(cx, |this, cx| this.undo_or_redo(true, window, cx));
                     },
                 ))
             })
@@ -1938,6 +2058,7 @@ impl InkdownApp {
         let write = self.view_mode == ViewMode::Write;
         let split = self.view_mode == ViewMode::Split;
         let preview = self.view_mode == ViewMode::Preview;
+        let live = self.view_mode == ViewMode::Live;
         let sidebar = self.sidebar_visible;
         self.menu_button("menu-view", "视图")
             .dropdown_menu(move |menu, _, _| {
@@ -1955,6 +2076,11 @@ impl InkdownApp {
                     PopupMenuItem::new("预览视图")
                         .checked(preview)
                         .action(Box::new(ViewPreview)),
+                )
+                .item(
+                    PopupMenuItem::new("实时视图（所见即所得）")
+                        .checked(live)
+                        .action(Box::new(ViewLive)),
                 )
                 .separator()
                 .item(PopupMenuItem::new("在预览中查找").action(Box::new(PreviewFind)))
@@ -2035,7 +2161,7 @@ impl InkdownApp {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(self.file_menu())
-            .child(self.edit_menu())
+            .child(self.edit_menu(cx))
             .child(self.format_menu())
             .child(self.view_menu(dark))
             .child(widgets::hairline(cx))
@@ -2176,14 +2302,14 @@ impl InkdownApp {
                 IconName::Undo,
                 "撤销",
                 cx,
-                |this, window, cx| this.dispatch_editor_action(Box::new(Undo), window, cx),
+                |this, window, cx| this.undo_or_redo(false, window, cx),
             ))
             .child(Self::tool(
                 "toolbar-redo",
                 IconName::Redo,
                 "重做",
                 cx,
-                |this, window, cx| this.dispatch_editor_action(Box::new(Redo), window, cx),
+                |this, window, cx| this.undo_or_redo(true, window, cx),
             ))
             .child(widgets::hairline(cx))
             .child(Self::tool(
@@ -2313,6 +2439,19 @@ impl InkdownApp {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.set_view(ViewMode::Preview, window, cx)
                     })),
+            )
+            .child(
+                Button::new("view-live")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::BookOpen)
+                    .tooltip("实时视图（所见即所得）· Ctrl+4")
+                    .selected(self.view_mode == ViewMode::Live)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.set_view(ViewMode::Live, window, cx)
+                        }),
+                    ),
             )
     }
 
@@ -3290,8 +3429,9 @@ impl InkdownApp {
             self.close_preview_find(window, cx);
             return;
         }
-        if self.view_mode == ViewMode::Write {
-            self.view_mode = ViewMode::Split;
+        if matches!(self.view_mode, ViewMode::Write | ViewMode::Live) {
+            // 实时模式里预览查找不可用（渲染面不可框选），退回分栏。
+            self.set_view(ViewMode::Split, window, cx);
         }
         self.preview_find_open = true;
         let focus = self.preview_find.read(cx).focus_handle(cx);
@@ -6161,7 +6301,12 @@ impl InkdownApp {
         self.reveal_selected(cx);
     }
 
-    fn on_close_overlay(&mut self, _: &CloseOverlay, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_close_overlay(&mut self, _: &CloseOverlay, window: &mut Window, cx: &mut Context<Self>) {
+        // Esc 结束实时模式的块编辑（LiveEdit 键上下文只在块输入框聚焦时生效）。
+        if self.live_editing.is_some() {
+            self.live_commit(window, cx);
+            return;
+        }
         if self.slash.take().is_some() {
             cx.notify();
             return;
@@ -8597,6 +8742,358 @@ impl InkdownApp {
             )
     }
 
+    // ---- live (block-level wysiwyg) --------------------------------------
+
+    /// 实时卡片：整页按预览同款渲染成阅读态，点击任意块把它的源码就地换成
+    /// 自动增高的输入框，失焦 / Esc / 智能 Enter 提交回主文档。
+    fn live_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let editing = self.live_editing.clone();
+        let blocks = self.live_blocks.clone();
+        let exts = self.live_exts.clone();
+        let block_editor = self.block_editor.clone();
+        let list_state = self.live_list.clone();
+        let weak = cx.weak_entity();
+        let doc_dir = std::sync::Arc::new(self.current_doc_dir());
+        let border = cx.theme().border;
+        let popover = cx.theme().popover;
+        let muted = cx.theme().muted_foreground;
+        let accent = cx.theme().success;
+
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(popover)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .h(px(36.))
+                    .w_full()
+                    .flex_shrink_0()
+                    .px_4()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(popover)
+                    .child(widgets::dot(accent))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child("LIVE"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted.opacity(0.7))
+                            .child("实时 · 点击任意块编辑"),
+                    )
+                    .child(div().flex_1()),
+            )
+            .child(
+                div()
+                    .id("live-body")
+                    .key_context("LiveView")
+                    .flex_1()
+                    .min_h_0()
+                    .track_focus(&self.live_focus)
+                    .overflow_hidden()
+                    .px(px(38.))
+                    .pt(px(34.))
+                    .pb(px(64.))
+                    .child(
+                        list(list_state, move |ix, window, cx| {
+                            // 虚拟新段落占一个额外槽位：插在 span 位置的块之前。
+                            let (block_ix, show_edit) = match &editing {
+                                None => (ix, false),
+                                Some(edit) if edit.virtual_slot => {
+                                    if ix < edit.slot {
+                                        (ix, false)
+                                    } else if ix == edit.slot {
+                                        (usize::MAX, true)
+                                    } else {
+                                        (ix - 1, false)
+                                    }
+                                }
+                                Some(edit) => (ix, ix == edit.slot),
+                            };
+                            if show_edit {
+                                let weak = weak.clone();
+                                let editor = block_editor.clone();
+                                return div()
+                                .id("live-block-edit")
+                                .key_context("LiveEdit")
+                                .w_full()
+                                .child(Textarea::new(&editor).w_full())
+                                .on_action(
+                                    move |_: &gpui_kit::component::input::Enter,
+                                          window: &mut Window,
+                                          cx: &mut App| {
+                                        let _ = weak
+                                            .update(cx, |this, cx| this.live_on_enter(window, cx));
+                                    },
+                                )
+                                .into_any_element();
+                            }
+                            let Some(block) = blocks.get(block_ix) else {
+                                return div().into_any_element();
+                            };
+                            let Some(span) = block.span() else {
+                                return div().into_any_element();
+                            };
+                            let refs: Vec<&BlockNode> = blocks.iter().collect();
+                            let flow =
+                                FlowPosition::at(&refs, block_ix, block_ix + 1 == blocks.len());
+                            let ctx = RenderContext::from_app(cx)
+                                .with_markdown_extensions(exts.clone())
+                                .with_image_source({
+                                    let doc_dir = doc_dir.clone();
+                                    move |uri| {
+                                        let source = uri.to_string();
+                                        if let Some(path) =
+                                            publish::local_path(&source, doc_dir.as_ref())
+                                        {
+                                            if path.exists() {
+                                                return ImageSource::from(path);
+                                            }
+                                        }
+                                        ImageSource::from(source)
+                                    }
+                                });
+                            let weak = weak.clone();
+                            let block_ix = block_ix;
+                            div()
+                                .id(("live-block", span.start))
+                                .w_full()
+                                .cursor_pointer()
+                                .hover(|style| style.opacity(0.85))
+                                .on_click(move |_, window, cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.live_open_block(block_ix, window, cx)
+                                    });
+                                })
+                                .child(block.render_with_id(
+                                    ("live-rendered", span.start),
+                                    flow,
+                                    &ctx,
+                                    window,
+                                    cx,
+                                ))
+                                .into_any_element()
+                        })
+                        .size_full(),
+                    ),
+            )
+    }
+
+    /// 当前列表条目数：解析块 + 可能挂着的虚拟新段落。
+    fn live_item_count(&self) -> usize {
+        self.live_blocks.len()
+            + usize::from(self.live_editing.as_ref().is_some_and(|e| e.virtual_slot))
+    }
+
+    /// 条目数与列表对齐；没变就不 reset，保住滚动位置。
+    fn live_sync_count(&mut self) {
+        let items = self.live_item_count();
+        if self.live_list.item_count() != items {
+            self.live_list.reset(items);
+        }
+    }
+
+    /// 按当前主文档重建块树。提交、撤销、整篇替换后都会走到这里。
+    fn live_reparse(&mut self, cx: &mut Context<Self>) {
+        let value = self.editor.read(cx).value().to_string();
+        let blocks = live::parse(&value);
+        // 空文档的占位编辑（0..0 虚拟槽）在文档重建后有了真实内容就失效了：
+        // 例如清空旧文档后立刻切到别的文稿。智能 Enter 的虚拟块 span 至少
+        // 是 2（前面总有两个换行），不会被误丢。
+        if !blocks.is_empty()
+            && self
+                .live_editing
+                .as_ref()
+                .is_some_and(|edit| edit.virtual_slot && edit.span == (0..0))
+        {
+            self.live_editing = None;
+        }
+        self.live_blocks = std::sync::Arc::new(blocks);
+        self.live_sync_count();
+    }
+
+    /// `pos` 之后第一个块的槽位——虚拟新段落挂在这里（没有对应块时是末尾）。
+    fn live_slot_for_pos(&self, pos: usize) -> usize {
+        self.live_blocks
+            .iter()
+            .position(|block| block.span().is_some_and(|span| span.start >= pos))
+            .unwrap_or(self.live_blocks.len())
+    }
+
+    fn focus_block_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self.block_editor.read(cx).focus_handle(cx);
+        focus.focus(window, cx);
+    }
+
+    /// 把块源码装进就地输入框开始编辑。`caret` 是块内字节光标：
+    /// 点击打开放在末尾（接着写），智能 Enter 续写的新块放在开头。
+    fn live_start_edit(
+        &mut self,
+        slot: usize,
+        span: Range<usize>,
+        text: String,
+        enter: live::EnterAction,
+        caret: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut caret = caret.min(text.len());
+        while caret > 0 && !text.is_char_boundary(caret) {
+            caret -= 1;
+        }
+        let submit = enter == live::EnterAction::Split;
+        self.block_editor.update(cx, |state, cx| {
+            state.set_value(&text, window, cx);
+            state.set_selected_range(caret..caret, cx);
+            state.set_submit_on_enter(submit, cx);
+        });
+        self.live_editing = Some(LiveEdit {
+            slot,
+            span,
+            original: text,
+            enter,
+            virtual_slot: false,
+        });
+        self.live_sync_count();
+        self.focus_block_editor(window, cx);
+        cx.notify();
+    }
+
+    /// 打开一个还没有源码的新段落：空文档开篇，或智能 Enter 切出的空尾块。
+    fn live_open_virtual(
+        &mut self,
+        slot: usize,
+        pos: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.block_editor.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.set_selected_range(0..0, cx);
+            state.set_submit_on_enter(true, cx);
+        });
+        self.live_editing = Some(LiveEdit {
+            slot,
+            span: pos..pos,
+            original: String::new(),
+            enter: live::EnterAction::Split,
+            virtual_slot: true,
+        });
+        self.live_sync_count();
+        self.focus_block_editor(window, cx);
+        cx.notify();
+    }
+
+    /// 点击现有块进入编辑（已在编辑则只把焦点接回去）。
+    fn live_open_block(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_mode != ViewMode::Live {
+            return;
+        }
+        if self
+            .live_editing
+            .as_ref()
+            .is_some_and(|edit| edit.slot == ix && !edit.virtual_slot)
+        {
+            self.focus_block_editor(window, cx);
+            return;
+        }
+        self.live_commit(window, cx);
+        let Some(block) = self.live_blocks.get(ix) else {
+            return;
+        };
+        let (span, enter) = match block.span() {
+            Some(span) => (span.start..span.end, live::enter_action(block)),
+            None => return,
+        };
+        let source = self.editor.read(cx).value().to_string();
+        let Some(text) = source.get(span.clone()).map(str::to_string) else {
+            return;
+        };
+        let caret = text.len();
+        self.live_start_edit(ix, span, text, enter, caret, window, cx);
+    }
+
+    /// 把就地输入框的内容提交回主文档；值没变化时只收起编辑。
+    /// 主编辑器的替换是 Atomic 事务——整个块的修改在撤销里是一步。
+    fn live_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.live_editing.take() else {
+            return;
+        };
+        let value = self.block_editor.read(cx).value().to_string();
+        if value != edit.original {
+            self.editor.update(cx, |state, cx| {
+                state.set_selected_range(edit.span.clone(), cx);
+                state.replace(value, window, cx);
+            });
+            self.live_reparse(cx);
+        } else {
+            self.live_sync_count();
+        }
+        // 最后一块内容被删空：实时页不留空白死角，直接落下占位输入。
+        if self.view_mode == ViewMode::Live && self.live_blocks.is_empty() {
+            self.live_open_virtual(0, 0, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 智能 Enter：段落/标题在光标处切开，下半成为其后的新段落并立即进入
+    /// 编辑（连续写作节奏）；结构化块走 submit 关闭的原生换行，动作不传播，
+    /// 不会走到这里——保险起见再放回去。
+    fn live_on_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_mode != ViewMode::Live {
+            return;
+        }
+        let Some(edit) = self.live_editing.take() else {
+            return;
+        };
+        if edit.enter != live::EnterAction::Split {
+            self.live_editing = Some(edit);
+            return;
+        }
+        let source = self.block_editor.read(cx).value().to_string();
+        let caret = self.block_editor.read(cx).cursor();
+        let (stay, rest) = live::split_for_enter(&source, caret);
+        let pos = edit.span.start + stay.len() + 2;
+        let replacement = format!("{stay}\n\n{rest}");
+        self.editor.update(cx, |state, cx| {
+            state.set_selected_range(edit.span.clone(), cx);
+            state.replace(replacement, window, cx);
+        });
+        self.live_reparse(cx);
+        let slot = self.live_slot_for_pos(pos);
+        if rest.is_empty() {
+            self.live_open_virtual(slot, pos, window, cx);
+        } else {
+            let existing = self
+                .live_blocks
+                .get(slot)
+                .filter(|block| block.span().is_some_and(|span| span.start == pos))
+                .map(|block| {
+                    let span = block.span().expect("span checked");
+                    (span.start..span.end, live::enter_action(block))
+                });
+            match existing {
+                Some((span, enter)) => {
+                    self.live_start_edit(slot, span, rest, enter, 0, window, cx);
+                }
+                None => self.live_open_virtual(slot, pos, window, cx),
+            }
+        }
+        self.live_list.scroll_to_reveal_item(slot);
+        cx.notify();
+    }
+
     fn workspace(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.view_mode {
             ViewMode::Write => div()
@@ -8635,6 +9132,18 @@ impl InkdownApp {
                             resizable_panel()
                                 .child(div().size_full().pl(px(3.)).child(self.preview_card(cx))),
                         ),
+                )
+                .into_any_element(),
+            ViewMode::Live => div()
+                .size_full()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(880.))
+                        .h_full()
+                        .child(self.live_card(cx)),
                 )
                 .into_any_element(),
         };
@@ -8709,6 +9218,41 @@ impl InkdownApp {
         window.dispatch_action(action, cx);
     }
 
+    /// 撤销 / 重做的统一入口。实时视图里主编辑器没有挂载，Undo 动作
+    /// 没有接收者——临时切到写作视图、下一帧再分发，完成后切回。
+    fn undo_or_redo(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let was_live = self.view_mode == ViewMode::Live;
+        if was_live {
+            // 视图切换要等写作视图真正完成一次绘制、编辑器元素挂载后，
+            // 动作才有接收者；on_next_frame 在绘制前排水，单帧延迟时树
+            // 还是实时视图的，所以链两帧再分发，完成后切回实时。
+            self.set_view(ViewMode::Write, window, cx);
+            let app = cx.weak_entity();
+            window.on_next_frame(move |window, cx| {
+                let app = app.clone();
+                window.on_next_frame(move |window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        let action: Box<dyn Action> =
+                            if redo { Box::new(Redo) } else { Box::new(Undo) };
+                        this.dispatch_editor_action(action, window, cx);
+                        this.set_view(ViewMode::Live, window, cx);
+                    });
+                });
+            });
+            return;
+        }
+        let action: Box<dyn Action> = if redo { Box::new(Redo) } else { Box::new(Undo) };
+        self.dispatch_editor_action(action, window, cx);
+    }
+
+    fn on_live_undo(&mut self, _: &LiveUndo, window: &mut Window, cx: &mut Context<Self>) {
+        self.undo_or_redo(false, window, cx);
+    }
+
+    fn on_live_redo(&mut self, _: &LiveRedo, window: &mut Window, cx: &mut Context<Self>) {
+        self.undo_or_redo(true, window, cx);
+    }
+
     fn on_new(&mut self, _: &NewDocument, window: &mut Window, cx: &mut Context<Self>) {
         self.new_document(window, cx);
     }
@@ -8771,6 +9315,10 @@ impl InkdownApp {
 
     fn on_view_preview(&mut self, _: &ViewPreview, window: &mut Window, cx: &mut Context<Self>) {
         self.set_view(ViewMode::Preview, window, cx);
+    }
+
+    fn on_view_live(&mut self, _: &ViewLive, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(ViewMode::Live, window, cx);
     }
 
     fn on_format_bold(&mut self, _: &FormatBold, window: &mut Window, cx: &mut Context<Self>) {
@@ -8976,6 +9524,9 @@ impl Render for InkdownApp {
             .on_action(cx.listener(Self::on_view_write))
             .on_action(cx.listener(Self::on_view_split))
             .on_action(cx.listener(Self::on_view_preview))
+            .on_action(cx.listener(Self::on_view_live))
+            .on_action(cx.listener(Self::on_live_undo))
+            .on_action(cx.listener(Self::on_live_redo))
             .on_action(cx.listener(Self::on_format_bold))
             .on_action(cx.listener(Self::on_format_italic))
             .on_action(cx.listener(Self::on_format_strike))
