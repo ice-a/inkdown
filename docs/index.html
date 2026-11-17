@@ -215,11 +215,12 @@
   }
 
   /* ---------- shots ---------- */
-  /* App screenshots are detail-heavy — stacked full width so their edges
-     line up with every other section instead of floating inset. */
-  .duo {
-    display: grid; grid-template-columns: 1fr;
-    gap: 26px;
+  /* The 1360px app shots break out of the text column and render at their
+     native pixel size — capped by max-width so they are never upscaled. */
+  .shots-bleed { display: grid; gap: 26px; margin-bottom: 30px; }
+  .shots-bleed figure { margin: 0; }
+  .shots-bleed .shot {
+    display: block; width: 100%; max-width: 1360px; margin: 0 auto;
   }
   .duo-3 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 18px; }
   figure { margin: 0; }
@@ -229,7 +230,7 @@
     box-shadow: var(--shadow); background: var(--panel);
   }
   .shot-wide { max-width: 860px; margin: 18px auto 0; }
-  @media (max-width: 720px) { .duo, .duo-3 { grid-template-columns: 1fr; } }
+  @media (max-width: 720px) { .duo-3 { grid-template-columns: 1fr; } }
 
   /* ---------- features ---------- */
   .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
@@ -340,11 +341,15 @@
     </div>
   </section>
 
+  </div><!-- .wrap steps aside so the pair below can run full-bleed -->
+
   <section id="shots">
-    <div class="kicker">Screenshots</div>
-    <h2>两种样子</h2>
-    <p class="sub">浅色是暖纸，深色是墨夜，选择会被记住。</p>
-    <div class="duo">
+    <div class="wrap">
+      <div class="kicker">Screenshots</div>
+      <h2>两种样子</h2>
+      <p class="sub">浅色是暖纸，深色是墨夜，选择会被记住。</p>
+    </div>
+    <div class="shots-bleed">
       <figure>
         <img class="shot" src="screenshot-light.png" alt="暖纸主题：左侧源码，右侧实时预览" loading="lazy" width="1360" height="860">
         <figcaption>暖纸 · 写作分栏</figcaption>
@@ -354,21 +359,25 @@
         <figcaption>墨夜 · 写作分栏</figcaption>
       </figure>
     </div>
-    <div class="duo-3">
+    <div class="wrap">
+      <div class="duo-3">
+        <figure>
+          <img class="shot" src="screenshot-language.png" alt="代码块语言选择弹层" loading="lazy" width="656" height="590">
+          <figcaption>代码块语言 · 可搜索弹层</figcaption>
+        </figure>
+        <figure>
+          <img class="shot" src="screenshot-chat.png" alt="询问 AI 对话窗口" loading="lazy" width="664" height="696">
+          <figcaption>询问 AI · 多轮对话</figcaption>
+        </figure>
+      </div>
       <figure>
-        <img class="shot" src="screenshot-language.png" alt="代码块语言选择弹层" loading="lazy" width="656" height="590">
-        <figcaption>代码块语言 · 可搜索弹层</figcaption>
-      </figure>
-      <figure>
-        <img class="shot" src="screenshot-chat.png" alt="询问 AI 对话窗口" loading="lazy" width="664" height="696">
-        <figcaption>询问 AI · 多轮对话</figcaption>
+        <img class="shot shot-wide" src="screenshot-ai.png" alt="AI 一键排版预览" loading="lazy" width="1210" height="830">
+        <figcaption>AI 一键排版 · 先预览，确认才替换</figcaption>
       </figure>
     </div>
-    <figure>
-      <img class="shot shot-wide" src="screenshot-ai.png" alt="AI 一键排版预览" loading="lazy" width="1210" height="830">
-      <figcaption>AI 一键排版 · 先预览，确认才替换</figcaption>
-    </figure>
   </section>
+
+  <div class="wrap">
 
   <section id="features">
     <div class="kicker">Features</div>
